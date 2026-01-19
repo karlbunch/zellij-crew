@@ -16,20 +16,24 @@ Copy it to your zellij plugins directory or reference it directly in your config
 
 ## Configuration
 
-Add to your zellij config (e.g., `~/.config/zellij/config.kdl`):
+Add to your zellij config (`~/.config/zellij/config.kdl`):
 
 ```kdl
 plugins {
     crew location="file:/path/to/zellij_crew.wasm" {
-        names "alpha bravo charlie delta echo foxtrot golf hotel india juliet kilo lima mike november oscar papa quebec romeo sierra tango uniform victor whiskey xray yankee zulu"
-        mode "round-robin"
+        names "alice bob carol dave eve frank grace henry iris jack"
+        mode "fill-in"
         show_position "false"
         rename_custom "false"
     }
 }
+
+load_plugins {
+    "crew"
+}
 ```
 
-Then load it in your layout or use `zellij plugin -- file:/path/to/zellij_crew.wasm`.
+The plugin loads in the background - no pane needed. Restart zellij for config changes to take effect.
 
 ### Options
 

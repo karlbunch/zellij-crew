@@ -179,12 +179,21 @@ impl State {
                 continue;
             }
 
+            // Parse the stable tab index from "Tab #N" - this is what rename_tab expects
+            // (rename_tab uses index, not position, but TabInfo only gives us position)
+            let tab_index = match tab.name.strip_prefix("Tab #").and_then(|s| s.parse::<u32>().ok()) {
+                Some(n) => n,
+                None => {
+                    // Can't safely rename - we don't know the stable index
+                    eprintln!("zellij-crew: can't rename '{}' at pos {} - no stable index", tab.name, tab.position);
+                    continue;
+                }
+            };
+
             if let Some(name) = self.allocate_name() {
                 self.used_names.insert(name.clone());
                 let formatted = self.format_tab_name(&name, tab.position);
-                // rename_tab is 1-indexed
-                let tab_index = (tab.position + 1) as u32;
-                eprintln!("zellij-crew: renaming pos {} to '{}' (rename_tab({}))", tab.position, &formatted, tab_index);
+                eprintln!("zellij-crew: renaming '{}' at pos {} to '{}' (rename_tab({}))", tab.name, tab.position, &formatted, tab_index);
                 self.pending_rename = Some((tab.position, formatted.clone()));
                 rename_tab(tab_index, formatted);
                 return;

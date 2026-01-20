@@ -61,10 +61,12 @@ impl Config {
 
 #[derive(Default)]
 struct State {
-    tabs: Vec<TabInfo>,
-    active_tab_idx: usize,
-    assigned_names: BTreeMap<u32, String>,
+    // Names from our pool currently assigned to tabs
+    used_names: HashSet<String>,
+    // For round-robin: index of last assigned name in pool
     last_assigned_idx: Option<usize>,
+    // Pending rename: (position, expected_name) - ignore updates until confirmed
+    pending_rename: Option<(usize, String)>,
     config: Config,
 }
 
@@ -77,8 +79,8 @@ impl State {
         }
     }
 
-    fn get_used_names(&self) -> HashSet<&str> {
-        self.assigned_names.values().map(|s| s.as_str()).collect()
+    fn is_pool_name(&self, name: &str) -> bool {
+        self.config.names.iter().any(|n| n == name)
     }
 
     fn allocate_name_round_robin(&mut self) -> Option<String> {
@@ -86,7 +88,6 @@ impl State {
             return None;
         }
 
-        let used_names = self.get_used_names();
         let start_idx = self.last_assigned_idx.map(|i| i + 1).unwrap_or(0);
         let pool_len = self.config.names.len();
 
@@ -94,7 +95,7 @@ impl State {
         for offset in 0..pool_len {
             let idx = (start_idx + offset) % pool_len;
             let name = &self.config.names[idx];
-            if !used_names.contains(name.as_str()) {
+            if !self.used_names.contains(name) {
                 self.last_assigned_idx = Some(idx);
                 return Some(name.clone());
             }
@@ -105,11 +106,9 @@ impl State {
     }
 
     fn allocate_name_fill_in(&self) -> Option<String> {
-        let used_names = self.get_used_names();
-
         // Find first unused name in pool order
         for name in &self.config.names {
-            if !used_names.contains(name.as_str()) {
+            if !self.used_names.contains(name) {
                 return Some(name.clone());
             }
         }
@@ -134,67 +133,89 @@ impl State {
     }
 
     fn process_tabs(&mut self, tabs: Vec<TabInfo>) {
-        // Track which tab IDs still exist
-        let current_tab_ids: HashSet<u32> = tabs.iter().map(|t| t.position as u32).collect();
+        // Debug: log incoming tabs with all relevant fields
+        let tab_info: Vec<_> = tabs.iter().map(|t| format!("pos{}:'{}'", t.position, &t.name)).collect();
+        eprintln!("zellij-crew: TabUpdate tabs={:?} pending={:?}", tab_info, self.pending_rename);
+        // Log full TabInfo to see what fields are available
+        if !tabs.is_empty() {
+            eprintln!("zellij-crew: First tab debug: {:?}", tabs[0]);
+        }
 
-        // Remove assignments for tabs that no longer exist
-        self.assigned_names
-            .retain(|tab_id, _| current_tab_ids.contains(tab_id));
+        // If we have a pending rename, wait for it to be confirmed before doing anything else
+        if let Some((pos, expected_name)) = &self.pending_rename {
+            if let Some(tab) = tabs.iter().find(|t| t.position == *pos) {
+                if &tab.name == expected_name {
+                    // Rename confirmed!
+                    eprintln!("zellij-crew: pending rename confirmed for pos {} = '{}'", pos, expected_name);
+                    self.pending_rename = None;
+                } else {
+                    // Still waiting for rename to take effect
+                    eprintln!("zellij-crew: waiting for pending rename pos {} (have '{}', want '{}')", pos, &tab.name, expected_name);
+                    return;
+                }
+            } else {
+                // Tab at that position no longer exists, clear pending
+                eprintln!("zellij-crew: pending rename pos {} no longer exists, clearing", pos);
+                self.pending_rename = None;
+            }
+        }
 
-        // Find tabs that need naming
-        let mut renames: Vec<(usize, String)> = Vec::new();
-
+        // First pass: update used_names based on current tab names
+        let mut current_pool_names: HashSet<String> = HashSet::new();
         for tab in &tabs {
-            let tab_id = tab.position as u32;
+            if self.is_pool_name(&tab.name) {
+                current_pool_names.insert(tab.name.clone());
+            }
+        }
+        self.used_names = current_pool_names.clone();
+        eprintln!("zellij-crew: used_names={:?}", current_pool_names);
 
-            // Skip if already assigned
-            if self.assigned_names.contains_key(&tab_id) {
+        // Second pass: find ONE tab needing a name and rename it
+        for tab in &tabs {
+            if self.is_pool_name(&tab.name) {
                 continue;
             }
-
-            // Skip custom names if rename_custom is false
             if !self.config.rename_custom && !Self::is_default_name(&tab.name) {
                 continue;
             }
 
-            // Allocate a name
             if let Some(name) = self.allocate_name() {
-                self.assigned_names.insert(tab_id, name.clone());
+                self.used_names.insert(name.clone());
                 let formatted = self.format_tab_name(&name, tab.position);
-                renames.push((tab.position, formatted));
+                // rename_tab is 1-indexed
+                let tab_index = (tab.position + 1) as u32;
+                eprintln!("zellij-crew: renaming pos {} to '{}' (rename_tab({}))", tab.position, &formatted, tab_index);
+                self.pending_rename = Some((tab.position, formatted.clone()));
+                rename_tab(tab_index, formatted);
+                return;
             }
         }
-
-        // Update stored tabs
-        self.tabs = tabs;
-
-        // Execute renames
-        for (position, new_name) in renames {
-            rename_tab(position as u32 + 1, new_name);
-        }
+        eprintln!("zellij-crew: no tabs need renaming");
     }
 }
 
+#[cfg(target_family = "wasm")]
 register_plugin!(State);
 
+#[cfg(target_family = "wasm")]
 impl ZellijPlugin for State {
     fn load(&mut self, configuration: BTreeMap<String, String>) {
         self.config = Config::from_btreemap(&configuration);
 
-        request_permission(&[PermissionType::ReadApplicationState]);
+        request_permission(&[
+            PermissionType::ReadApplicationState,
+            PermissionType::ChangeApplicationState,
+        ]);
         subscribe(&[EventType::TabUpdate, EventType::PermissionRequestResult]);
     }
 
     fn update(&mut self, event: Event) -> bool {
         match event {
             Event::TabUpdate(tabs) => {
-                if let Some(active_idx) = tabs.iter().position(|t| t.active) {
-                    self.active_tab_idx = active_idx;
-                }
                 self.process_tabs(tabs);
             }
             Event::PermissionRequestResult(PermissionStatus::Granted) => {
-                set_selectable(false);
+                // Re-subscribe after permission granted
                 subscribe(&[EventType::TabUpdate]);
             }
             Event::PermissionRequestResult(PermissionStatus::Denied) => {
@@ -273,32 +294,32 @@ mod tests {
         let mut state = make_state(&["a", "b", "c"], AllocationMode::RoundRobin);
 
         assert_eq!(state.allocate_name(), Some("a".to_string()));
-        state.assigned_names.insert(0, "a".to_string());
+        state.used_names.insert("a".to_string());
 
         assert_eq!(state.allocate_name(), Some("b".to_string()));
-        state.assigned_names.insert(1, "b".to_string());
+        state.used_names.insert("b".to_string());
 
         assert_eq!(state.allocate_name(), Some("c".to_string()));
-        state.assigned_names.insert(2, "c".to_string());
+        state.used_names.insert("c".to_string());
 
         // Pool exhausted
         assert_eq!(state.allocate_name(), None);
     }
 
     #[test]
-    fn test_round_robin_skips_freed_names() {
+    fn test_round_robin_skips_used_names() {
         let mut state = make_state(&["a", "b", "c", "d"], AllocationMode::RoundRobin);
 
         // Allocate a, b, c
         assert_eq!(state.allocate_name(), Some("a".to_string()));
-        state.assigned_names.insert(0, "a".to_string());
+        state.used_names.insert("a".to_string());
         assert_eq!(state.allocate_name(), Some("b".to_string()));
-        state.assigned_names.insert(1, "b".to_string());
+        state.used_names.insert("b".to_string());
         assert_eq!(state.allocate_name(), Some("c".to_string()));
-        state.assigned_names.insert(2, "c".to_string());
+        state.used_names.insert("c".to_string());
 
         // Free "b"
-        state.assigned_names.remove(&1);
+        state.used_names.remove("b");
 
         // Next allocation should be "d", not "b" (round-robin continues forward)
         assert_eq!(state.allocate_name(), Some("d".to_string()));
@@ -310,14 +331,14 @@ mod tests {
 
         // Allocate a, b, c
         assert_eq!(state.allocate_name(), Some("a".to_string()));
-        state.assigned_names.insert(0, "a".to_string());
+        state.used_names.insert("a".to_string());
         assert_eq!(state.allocate_name(), Some("b".to_string()));
-        state.assigned_names.insert(1, "b".to_string());
+        state.used_names.insert("b".to_string());
         assert_eq!(state.allocate_name(), Some("c".to_string()));
-        state.assigned_names.insert(2, "c".to_string());
+        state.used_names.insert("c".to_string());
 
         // Free "b"
-        state.assigned_names.remove(&1);
+        state.used_names.remove("b");
 
         // Fill-in should reuse "b"
         assert_eq!(state.allocate_name(), Some("b".to_string()));
@@ -327,15 +348,15 @@ mod tests {
     fn test_fill_in_fills_gaps_in_order() {
         let mut state = make_state(&["a", "b", "c", "d"], AllocationMode::FillIn);
 
-        // Allocate a, b, c, d
-        state.assigned_names.insert(0, "a".to_string());
-        state.assigned_names.insert(1, "b".to_string());
-        state.assigned_names.insert(2, "c".to_string());
-        state.assigned_names.insert(3, "d".to_string());
+        // Mark a, b, c, d as used
+        state.used_names.insert("a".to_string());
+        state.used_names.insert("b".to_string());
+        state.used_names.insert("c".to_string());
+        state.used_names.insert("d".to_string());
 
         // Free "b" and "d"
-        state.assigned_names.remove(&1);
-        state.assigned_names.remove(&3);
+        state.used_names.remove("b");
+        state.used_names.remove("d");
 
         // Fill-in should return "b" first (earlier in pool order)
         assert_eq!(state.allocate_name(), Some("b".to_string()));
@@ -363,5 +384,14 @@ mod tests {
 
         state.config.mode = AllocationMode::FillIn;
         assert_eq!(state.allocate_name(), None);
+    }
+
+    #[test]
+    fn test_is_pool_name() {
+        let state = make_state(&["alice", "bob", "carol"], AllocationMode::FillIn);
+        assert!(state.is_pool_name("alice"));
+        assert!(state.is_pool_name("bob"));
+        assert!(!state.is_pool_name("Tab #1"));
+        assert!(!state.is_pool_name("mywork"));
     }
 }

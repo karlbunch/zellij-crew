@@ -531,6 +531,125 @@ plugins {
 - Color theming
 - Performance tuning
 
+## Default Tab-Bar Plugin Analysis
+
+Analysis of zellij's default tab-bar plugin (from `default-plugins/tab-bar/src/`).
+
+### File Structure (~620 lines total)
+
+| File | Lines | Purpose |
+|------|-------|---------|
+| `main.rs` | 164 | Plugin lifecycle, state management, mouse handling |
+| `tab.rs` | 141 | Individual tab rendering, multi-user indicators |
+| `line.rs` | 465 | Tab line layout, overflow handling, keybind display |
+
+### Key Data Structures
+
+**LinePart** - Core rendering unit that pairs styled content with width:
+```rust
+pub struct LinePart {
+    part: String,              // ANSI-styled text content
+    len: usize,                // Visual width (for layout calculations)
+    tab_index: Option<usize>,  // For mouse click detection
+}
+```
+
+**State** - Plugin state:
+```rust
+struct State {
+    tabs: Vec<TabInfo>,
+    active_tab_idx: usize,
+    mode_info: ModeInfo,           // Contains palette/colors/capabilities
+    tab_line: Vec<LinePart>,       // Cached for mouse click handling
+    hide_swap_layout_indication: bool,
+}
+```
+
+### Plugin Lifecycle
+
+**load():**
+- Parse config from `BTreeMap<String, String>`
+- Call `set_selectable(false)` - tab bar should not steal focus
+- Subscribe to: `TabUpdate`, `ModeUpdate`, `Mouse`
+
+**update():**
+- `ModeUpdate`: Store `mode_info` (contains colors/palette)
+- `TabUpdate`: Store tabs, find `active_tab_idx`
+- `Mouse`: Handle `LeftClick` (tab switch), `ScrollUp/Down` (tab navigation)
+- Returns `bool` indicating whether to re-render
+
+**render():**
+- Build `LinePart` for each tab via `tab_style()`
+- Call `tab_line()` to handle layout with overflow
+- Print with ANSI background fill to end of line
+
+### Multi-User Indicator Pattern
+
+Located in `tab.rs:7-21, 59-82`. This is the template for our activity indicators:
+
+```rust
+fn cursors(focused_clients: &[ClientId], colors: MultiplayerColors) -> (Vec<ANSIString>, usize) {
+    let mut cursors = vec![];
+    for client_id in focused_clients {
+        if let Some(color) = client_id_to_colors(*client_id, colors) {
+            // Each user gets a colored space block
+            cursors.push(style!(color.1, color.0).paint(" "));
+        }
+    }
+    (cursors, len)
+}
+```
+
+Rendered after tab name as: `tabname[■ ■]` where each `■` is a colored space.
+
+### Tab Styling Flow
+
+1. `tab_style()` - Entry point, appends "(FULLSCREEN)" or "(SYNC)" if needed
+2. `render_tab()` - Builds the actual styled output with separators
+3. Uses `palette.ribbon_selected` / `ribbon_unselected` for colors
+4. Separator: `""` (powerline arrow) when `capabilities.arrow_fonts`, else empty
+
+### Overflow Handling
+
+When tabs don't fit in available width (`line.rs:15-108`):
+- Active tab is always shown
+- Adds tabs left/right alternately while they fit
+- Shows collapsed indicators: `← +N` (left) and `+N →` (right)
+- Clicking collapsed indicator jumps to first hidden tab in that direction
+
+### Dependencies
+
+```toml
+ansi_term = "0.12"           # ANSI styling
+unicode-width = "0.1.8"      # Unicode character width calculation
+zellij-tile                  # Plugin API
+zellij-tile-utils            # style!() macro for ANSI styling
+```
+
+### Patterns to Adopt
+
+1. **LinePart pattern** - Separate styled content from width tracking
+2. **Two-level rendering** - `tab_style()` → `render_tab()` abstraction
+3. **Mouse handling** - Cache `tab_line` for click coordinate detection
+4. **Palette integration** - Use `mode_info.style.colors` for theming
+5. **set_selectable(false)** - Tab bar shouldn't steal keyboard focus
+6. **Overflow handling** - Show `← +N` / `+N →` when tabs don't fit
+
+### Activity Indicator Integration Point
+
+In `render_tab()` (tab.rs:59-82), after the tab text but before the right separator,
+we can add our activity indicator using the same pattern as multi-user cursors:
+
+```rust
+// After existing multi-user cursor section
+if let Some(indicator) = get_activity_indicator(tab_id, &tab_state) {
+    let indicator_styled = style!(indicator_color, background_color)
+        .paint(indicator_symbol);
+    s.push_str(&indicator_styled.to_string());
+    tab_text_len += indicator_symbol.width();
+}
+```
+
 ## Future: Inter-Agent Messaging
 
 With the pipe infrastructure in place, agents can send messages to each other:

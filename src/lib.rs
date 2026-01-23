@@ -1,7 +1,19 @@
+// zellij-crew: Tab naming and tab-bar plugin
+
+mod line;
+mod tab;
+
 use std::collections::{BTreeMap, HashSet};
 use zellij_tile::prelude::*;
 
+use crate::line::{build_tab_line, LinePart};
+use crate::tab::render_tab;
+
 const DEFAULT_NAMES: &str = "alpha bravo charlie delta echo foxtrot golf hotel india juliet kilo lima mike november oscar papa quebec romeo sierra tango uniform victor whiskey xray yankee zulu";
+
+// ============================================================================
+// Configuration
+// ============================================================================
 
 #[derive(Debug, Clone, PartialEq)]
 enum AllocationMode {
@@ -59,16 +71,36 @@ impl Config {
     }
 }
 
+// ============================================================================
+// Plugin State
+// ============================================================================
+
 #[derive(Default)]
 struct State {
-    // Names from our pool currently assigned to tabs
+    // Tab information from TabUpdate
+    tabs: Vec<TabInfo>,
+    active_tab_idx: usize,
+
+    // Mode and styling info from ModeUpdate
+    mode_info: Option<ModeInfo>,
+
+    // Cached tab line for mouse click detection
+    tab_line: Vec<LinePart>,
+
+    // Name allocation state
     used_names: HashSet<String>,
-    // For round-robin: index of last assigned name in pool
     last_assigned_idx: Option<usize>,
-    // Pending rename: (position, expected_name) - ignore updates until confirmed
+
+    // Pending rename: (position, expected_name)
     pending_rename: Option<(usize, String)>,
+
+    // Configuration
     config: Config,
 }
+
+// ============================================================================
+// Name Allocation
+// ============================================================================
 
 impl State {
     fn is_default_name(name: &str) -> bool {
@@ -91,7 +123,6 @@ impl State {
         let start_idx = self.last_assigned_idx.map(|i| i + 1).unwrap_or(0);
         let pool_len = self.config.names.len();
 
-        // Try each name starting from after the last assigned
         for offset in 0..pool_len {
             let idx = (start_idx + offset) % pool_len;
             let name = &self.config.names[idx];
@@ -101,19 +132,16 @@ impl State {
             }
         }
 
-        // Pool exhausted
         None
     }
 
     fn allocate_name_fill_in(&self) -> Option<String> {
-        // Find first unused name in pool order
         for name in &self.config.names {
             if !self.used_names.contains(name) {
                 return Some(name.clone());
             }
         }
 
-        // Pool exhausted
         None
     }
 
@@ -132,35 +160,58 @@ impl State {
         }
     }
 
-    fn process_tabs(&mut self, tabs: Vec<TabInfo>) {
-        // Debug: log incoming tabs with all relevant fields
-        let tab_info: Vec<_> = tabs.iter().map(|t| format!("pos{}:'{}'", t.position, &t.name)).collect();
-        eprintln!("zellij-crew: TabUpdate tabs={:?} pending={:?}", tab_info, self.pending_rename);
-        // Log full TabInfo to see what fields are available
-        if !tabs.is_empty() {
-            eprintln!("zellij-crew: First tab debug: {:?}", tabs[0]);
+    /// Get the display name for a tab (either assigned name or original)
+    fn get_display_name(&self, tab: &TabInfo) -> String {
+        // If tab already has a pool name, use it
+        if self.is_pool_name(&tab.name) {
+            return tab.name.clone();
         }
+        // Otherwise use original name
+        tab.name.clone()
+    }
+}
 
-        // If we have a pending rename, wait for it to be confirmed before doing anything else
+// ============================================================================
+// Tab Processing (for background renaming mode)
+// ============================================================================
+
+impl State {
+    fn process_tabs(&mut self, tabs: Vec<TabInfo>) {
+        let tab_info: Vec<_> = tabs
+            .iter()
+            .map(|t| format!("pos{}:'{}'", t.position, &t.name))
+            .collect();
+        eprintln!(
+            "zellij-crew: TabUpdate tabs={:?} pending={:?}",
+            tab_info, self.pending_rename
+        );
+
+        // Handle pending rename confirmation
         if let Some((pos, expected_name)) = &self.pending_rename {
             if let Some(tab) = tabs.iter().find(|t| t.position == *pos) {
                 if &tab.name == expected_name {
-                    // Rename confirmed!
-                    eprintln!("zellij-crew: pending rename confirmed for pos {} = '{}'", pos, expected_name);
+                    eprintln!(
+                        "zellij-crew: pending rename confirmed for pos {} = '{}'",
+                        pos, expected_name
+                    );
                     self.pending_rename = None;
                 } else {
-                    // Still waiting for rename to take effect
-                    eprintln!("zellij-crew: waiting for pending rename pos {} (have '{}', want '{}')", pos, &tab.name, expected_name);
+                    eprintln!(
+                        "zellij-crew: waiting for pending rename pos {} (have '{}', want '{}')",
+                        pos, &tab.name, expected_name
+                    );
                     return;
                 }
             } else {
-                // Tab at that position no longer exists, clear pending
-                eprintln!("zellij-crew: pending rename pos {} no longer exists, clearing", pos);
+                eprintln!(
+                    "zellij-crew: pending rename pos {} no longer exists, clearing",
+                    pos
+                );
                 self.pending_rename = None;
             }
         }
 
-        // First pass: update used_names based on current tab names
+        // Update used_names based on current tab names
         let mut current_pool_names: HashSet<String> = HashSet::new();
         for tab in &tabs {
             if self.is_pool_name(&tab.name) {
@@ -168,9 +219,17 @@ impl State {
             }
         }
         self.used_names = current_pool_names.clone();
-        eprintln!("zellij-crew: used_names={:?}", current_pool_names);
 
-        // Second pass: find ONE tab needing a name and rename it
+        // Find active tab
+        self.active_tab_idx = tabs
+            .iter()
+            .position(|t| t.active)
+            .unwrap_or(0);
+
+        // Store tabs for rendering
+        self.tabs = tabs.clone();
+
+        // Find ONE tab needing a name and rename it
         for tab in &tabs {
             if self.is_pool_name(&tab.name) {
                 continue;
@@ -179,13 +238,14 @@ impl State {
                 continue;
             }
 
-            // Parse the stable tab index from "Tab #N" - this is what rename_tab expects
-            // (rename_tab uses index, not position, but TabInfo only gives us position)
-            let tab_index = match tab.name.strip_prefix("Tab #").and_then(|s| s.parse::<u32>().ok()) {
+            let tab_index = match tab.name.strip_prefix("Tab #").and_then(|s| s.parse::<u32>().ok())
+            {
                 Some(n) => n,
                 None => {
-                    // Can't safely rename - we don't know the stable index
-                    eprintln!("zellij-crew: can't rename '{}' at pos {} - no stable index", tab.name, tab.position);
+                    eprintln!(
+                        "zellij-crew: can't rename '{}' at pos {} - no stable index",
+                        tab.name, tab.position
+                    );
                     continue;
                 }
             };
@@ -193,15 +253,93 @@ impl State {
             if let Some(name) = self.allocate_name() {
                 self.used_names.insert(name.clone());
                 let formatted = self.format_tab_name(&name, tab.position);
-                eprintln!("zellij-crew: renaming '{}' at pos {} to '{}' (rename_tab({}))", tab.name, tab.position, &formatted, tab_index);
+                eprintln!(
+                    "zellij-crew: renaming '{}' at pos {} to '{}' (rename_tab({}))",
+                    tab.name, tab.position, &formatted, tab_index
+                );
                 self.pending_rename = Some((tab.position, formatted.clone()));
                 rename_tab(tab_index, formatted);
                 return;
             }
         }
-        eprintln!("zellij-crew: no tabs need renaming");
     }
 }
+
+// ============================================================================
+// Mouse Handling
+// ============================================================================
+
+impl State {
+    fn handle_mouse_click(&self, x: usize) {
+        // Find which tab was clicked based on cached tab_line
+        let mut current_x = 0;
+        for part in &self.tab_line {
+            if x >= current_x && x < current_x + part.len {
+                if let Some(tab_idx) = part.tab_index {
+                    // Switch to this tab
+                    go_to_tab(tab_idx as u32 + 1);
+                    return;
+                }
+            }
+            current_x += part.len;
+        }
+    }
+
+    fn handle_scroll(&self, up: bool) {
+        if up {
+            go_to_previous_tab();
+        } else {
+            go_to_next_tab();
+        }
+    }
+}
+
+// ============================================================================
+// Rendering
+// ============================================================================
+
+impl State {
+    fn render_tab_bar(&mut self, cols: usize) {
+        if self.tabs.is_empty() {
+            return;
+        }
+
+        // Build LinePart for each tab
+        let mut tab_parts: Vec<LinePart> = Vec::new();
+        for (idx, tab) in self.tabs.iter().enumerate() {
+            let is_active = idx == self.active_tab_idx;
+            let display_name = self.get_display_name(tab);
+            let part = render_tab(tab, is_active, &display_name);
+            tab_parts.push(part);
+        }
+
+        // Handle overflow
+        let tab_line = build_tab_line(tab_parts, self.active_tab_idx, cols);
+
+        // Output the line
+        let mut output = String::new();
+        for part in &tab_line {
+            output.push_str(&part.part);
+        }
+
+        // Fill remaining width with empty ribbon
+        let used_width: usize = tab_line.iter().map(|p| p.len).sum();
+        if used_width < cols {
+            let fill = " ".repeat(cols - used_width);
+            let fill_text = Text::new(&fill);
+            output.push_str(&zellij_tile::ui_components::serialize_ribbon(&fill_text));
+        }
+
+        print!("{}", output);
+
+        // Cache for mouse handling
+        self.tab_line = tab_line;
+    }
+}
+
+// ============================================================================
+// Plugin Implementation
+// ============================================================================
 
 #[cfg(target_family = "wasm")]
 register_plugin!(State);
@@ -211,34 +349,61 @@ impl ZellijPlugin for State {
     fn load(&mut self, configuration: BTreeMap<String, String>) {
         self.config = Config::from_btreemap(&configuration);
 
+        // Tab bar should not steal keyboard focus
+        set_selectable(false);
+
         request_permission(&[
             PermissionType::ReadApplicationState,
             PermissionType::ChangeApplicationState,
         ]);
-        subscribe(&[EventType::TabUpdate, EventType::PermissionRequestResult]);
+
+        subscribe(&[
+            EventType::TabUpdate,
+            EventType::ModeUpdate,
+            EventType::Mouse,
+            EventType::PermissionRequestResult,
+        ]);
     }
 
     fn update(&mut self, event: Event) -> bool {
         match event {
+            Event::ModeUpdate(mode_info) => {
+                self.mode_info = Some(mode_info);
+                true // re-render
+            }
             Event::TabUpdate(tabs) => {
                 self.process_tabs(tabs);
+                true // re-render
+            }
+            Event::Mouse(mouse_event) => {
+                match mouse_event {
+                    Mouse::LeftClick(_, x) => self.handle_mouse_click(x),
+                    Mouse::ScrollUp(_) => self.handle_scroll(true),
+                    Mouse::ScrollDown(_) => self.handle_scroll(false),
+                    _ => {}
+                }
+                false // no re-render needed for mouse
             }
             Event::PermissionRequestResult(PermissionStatus::Granted) => {
-                // Re-subscribe after permission granted
-                subscribe(&[EventType::TabUpdate]);
+                subscribe(&[EventType::TabUpdate, EventType::ModeUpdate, EventType::Mouse]);
+                false
             }
             Event::PermissionRequestResult(PermissionStatus::Denied) => {
-                eprintln!("zellij-crew: Permission denied - tab renaming disabled");
+                eprintln!("zellij-crew: Permission denied - plugin disabled");
+                false
             }
-            _ => {}
+            _ => false,
         }
-        false // No rendering needed
     }
 
-    fn render(&mut self, _rows: usize, _cols: usize) {
-        // No UI rendering - this plugin only renames tabs
+    fn render(&mut self, _rows: usize, cols: usize) {
+        self.render_tab_bar(cols);
     }
 }
+
+// ============================================================================
+// Tests
+// ============================================================================
 
 #[cfg(test)]
 mod tests {
@@ -311,7 +476,6 @@ mod tests {
         assert_eq!(state.allocate_name(), Some("c".to_string()));
         state.used_names.insert("c".to_string());
 
-        // Pool exhausted
         assert_eq!(state.allocate_name(), None);
     }
 
@@ -319,7 +483,6 @@ mod tests {
     fn test_round_robin_skips_used_names() {
         let mut state = make_state(&["a", "b", "c", "d"], AllocationMode::RoundRobin);
 
-        // Allocate a, b, c
         assert_eq!(state.allocate_name(), Some("a".to_string()));
         state.used_names.insert("a".to_string());
         assert_eq!(state.allocate_name(), Some("b".to_string()));
@@ -327,10 +490,8 @@ mod tests {
         assert_eq!(state.allocate_name(), Some("c".to_string()));
         state.used_names.insert("c".to_string());
 
-        // Free "b"
         state.used_names.remove("b");
 
-        // Next allocation should be "d", not "b" (round-robin continues forward)
         assert_eq!(state.allocate_name(), Some("d".to_string()));
     }
 
@@ -338,7 +499,6 @@ mod tests {
     fn test_fill_in_reuses_freed_names() {
         let mut state = make_state(&["a", "b", "c", "d"], AllocationMode::FillIn);
 
-        // Allocate a, b, c
         assert_eq!(state.allocate_name(), Some("a".to_string()));
         state.used_names.insert("a".to_string());
         assert_eq!(state.allocate_name(), Some("b".to_string()));
@@ -346,10 +506,8 @@ mod tests {
         assert_eq!(state.allocate_name(), Some("c".to_string()));
         state.used_names.insert("c".to_string());
 
-        // Free "b"
         state.used_names.remove("b");
 
-        // Fill-in should reuse "b"
         assert_eq!(state.allocate_name(), Some("b".to_string()));
     }
 
@@ -357,17 +515,14 @@ mod tests {
     fn test_fill_in_fills_gaps_in_order() {
         let mut state = make_state(&["a", "b", "c", "d"], AllocationMode::FillIn);
 
-        // Mark a, b, c, d as used
         state.used_names.insert("a".to_string());
         state.used_names.insert("b".to_string());
         state.used_names.insert("c".to_string());
         state.used_names.insert("d".to_string());
 
-        // Free "b" and "d"
         state.used_names.remove("b");
         state.used_names.remove("d");
 
-        // Fill-in should return "b" first (earlier in pool order)
         assert_eq!(state.allocate_name(), Some("b".to_string()));
     }
 

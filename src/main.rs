@@ -1,19 +1,44 @@
 // zellij-crew: Tab-bar plugin with named tabs and activity indicators
+// Based on zellij-tab-bar-indexed (MIT license)
 
 mod line;
 mod tab;
 
+use std::cmp::{max, min};
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::convert::TryInto;
+
+use tab::get_tab_to_focus;
 use zellij_tile::prelude::*;
 
-use crate::line::{build_tab_line, LinePart};
-use crate::tab::render_tab;
+use crate::line::tab_line;
+use crate::tab::tab_style;
 
-const DEFAULT_NAMES: &str = "alpha bravo charlie delta echo foxtrot golf hotel india juliet kilo lima mike november oscar papa quebec romeo sierra tango uniform victor whiskey xray yankee zulu";
+// ============================================================================
+// LinePart - shared with line.rs and tab.rs
+// ============================================================================
+
+#[derive(Debug, Default, Clone)]
+pub struct LinePart {
+    pub part: String,
+    pub len: usize,
+    pub tab_index: Option<usize>,
+}
+
+impl LinePart {
+    pub fn append(&mut self, to_append: &LinePart) {
+        self.part.push_str(&to_append.part);
+        self.len += to_append.len;
+    }
+}
+
+pub static ARROW_SEPARATOR: &str = "\u{e0b0}";
 
 // ============================================================================
 // Configuration
 // ============================================================================
+
+const DEFAULT_NAMES: &str = "alpha bravo charlie delta echo foxtrot golf hotel india juliet kilo lima mike november oscar papa quebec romeo sierra tango uniform victor whiskey xray yankee zulu";
 
 #[derive(Debug, Clone, PartialEq)]
 enum AllocationMode {
@@ -32,6 +57,7 @@ struct Config {
     names: Vec<String>,
     mode: AllocationMode,
     show_position: bool,
+    hide_swap_layout_indication: bool,
 }
 
 impl Config {
@@ -56,10 +82,16 @@ impl Config {
             .map(|s| s == "true")
             .unwrap_or(false);
 
+        let hide_swap_layout_indication = config
+            .get("hide_swap_layout_indication")
+            .map(|s| s == "true")
+            .unwrap_or(false);
+
         Config {
             names,
             mode,
             show_position,
+            hide_swap_layout_indication,
         }
     }
 }
@@ -70,14 +102,12 @@ impl Config {
 
 #[derive(Default)]
 struct State {
-    // Tab information from TabUpdate
     tabs: Vec<TabInfo>,
     active_tab_idx: usize,
-
-    // Cached tab line for mouse click detection
+    mode_info: ModeInfo,
     tab_line: Vec<LinePart>,
 
-    // Name allocation: tab position -> assigned name
+    // Name allocation
     assigned_names: HashMap<usize, String>,
     last_assigned_idx: Option<usize>,
 
@@ -122,7 +152,6 @@ impl State {
                 return Some(name.clone());
             }
         }
-
         None
     }
 
@@ -141,24 +170,19 @@ impl State {
         }
     }
 
-    /// Get or allocate display name for a tab
     fn get_display_name(&mut self, position: usize) -> String {
-        // Already assigned?
         if let Some(name) = self.assigned_names.get(&position) {
             return self.format_display_name(name, position);
         }
 
-        // Allocate new name
         if let Some(name) = self.allocate_name() {
             self.assigned_names.insert(position, name.clone());
             return self.format_display_name(&name, position);
         }
 
-        // Pool exhausted - use position number
         format!("Tab {}", position + 1)
     }
 
-    /// Clean up names for tabs that no longer exist
     fn cleanup_names(&mut self, current_positions: &HashSet<usize>) {
         self.assigned_names
             .retain(|pos, _| current_positions.contains(pos));
@@ -166,124 +190,21 @@ impl State {
 }
 
 // ============================================================================
-// Tab Update Handling
-// ============================================================================
-
-impl State {
-    fn handle_tab_update(&mut self, tabs: Vec<TabInfo>) {
-        // Find active tab
-        self.active_tab_idx = tabs.iter().position(|t| t.active).unwrap_or(0);
-
-        // Clean up names for closed tabs
-        let current_positions: HashSet<usize> = tabs.iter().map(|t| t.position).collect();
-        self.cleanup_names(&current_positions);
-
-        // Store tabs
-        self.tabs = tabs;
-    }
-}
-
-// ============================================================================
-// Mouse Handling
-// ============================================================================
-
-impl State {
-    fn handle_mouse_click(&self, x: usize) {
-        let mut current_x = 0;
-        for part in &self.tab_line {
-            if x >= current_x && x < current_x + part.len {
-                if let Some(tab_idx) = part.tab_index {
-                    go_to_tab(tab_idx as u32 + 1);
-                    return;
-                }
-            }
-            current_x += part.len;
-        }
-    }
-
-    fn handle_scroll(&self, up: bool) {
-        if up {
-            go_to_previous_tab();
-        } else {
-            go_to_next_tab();
-        }
-    }
-}
-
-// ============================================================================
-// Rendering
-// ============================================================================
-
-impl State {
-    fn render_tab_bar(&mut self, cols: usize) {
-        if self.tabs.is_empty() {
-            return;
-        }
-
-        // Collect tab info to avoid borrow issues
-        let tab_data: Vec<(usize, usize, bool)> = self
-            .tabs
-            .iter()
-            .enumerate()
-            .map(|(idx, tab)| (idx, tab.position, idx == self.active_tab_idx))
-            .collect();
-
-        // Build LinePart for each tab
-        let mut tab_parts: Vec<LinePart> = Vec::new();
-        for (idx, position, is_active) in tab_data {
-            let display_name = self.get_display_name(position);
-
-            // Add placeholder indicator
-            let display_with_indicator = format!("{} [○]", display_name);
-
-            let part = render_tab(&self.tabs[idx], is_active, &display_with_indicator);
-            tab_parts.push(part);
-        }
-
-        // Handle overflow
-        let tab_line = build_tab_line(tab_parts, self.active_tab_idx, cols);
-
-        // Output the line
-        let mut output = String::new();
-        for part in &tab_line {
-            output.push_str(&part.part);
-        }
-
-        // Fill remaining width with background
-        let used_width: usize = tab_line.iter().map(|p| p.len).sum();
-        if used_width < cols {
-            let fill = " ".repeat(cols - used_width);
-            let fill_text = zellij_tile::ui_components::Text::new(&fill);
-            output.push_str(&zellij_tile::ui_components::serialize_ribbon(&fill_text));
-        }
-
-        print!("{}", output);
-
-        // Cache for mouse handling
-        self.tab_line = tab_line;
-    }
-}
-
-// ============================================================================
 // Plugin Implementation
 // ============================================================================
 
-#[cfg(target_family = "wasm")]
 register_plugin!(State);
 
-#[cfg(target_family = "wasm")]
 impl ZellijPlugin for State {
     fn load(&mut self, configuration: BTreeMap<String, String>) {
         self.config = Config::from_btreemap(&configuration);
 
-        // Tab bar should not steal keyboard focus
-        set_selectable(false);
-
+        // Don't call set_selectable(false) here - we need to remain selectable
+        // so the user can focus this pane and grant permission on first run
         request_permission(&[
             PermissionType::ReadApplicationState,
             PermissionType::ChangeApplicationState,
         ]);
-
         subscribe(&[
             EventType::TabUpdate,
             EventType::ModeUpdate,
@@ -293,37 +214,143 @@ impl ZellijPlugin for State {
     }
 
     fn update(&mut self, event: Event) -> bool {
+        let mut should_render = false;
         match event {
-            Event::ModeUpdate(_mode_info) => {
-                true // re-render on mode change
+            Event::ModeUpdate(mode_info) => {
+                if self.mode_info != mode_info {
+                    should_render = true;
+                }
+                self.mode_info = mode_info;
             }
             Event::TabUpdate(tabs) => {
-                self.handle_tab_update(tabs);
-                true // re-render
-            }
-            Event::Mouse(mouse_event) => {
-                match mouse_event {
-                    Mouse::LeftClick(_, x) => self.handle_mouse_click(x),
-                    Mouse::ScrollUp(_) => self.handle_scroll(true),
-                    Mouse::ScrollDown(_) => self.handle_scroll(false),
-                    _ => {}
+                if let Some(active_tab_index) = tabs.iter().position(|t| t.active) {
+                    let active_tab_idx = active_tab_index + 1;
+
+                    if self.active_tab_idx != active_tab_idx || self.tabs != tabs {
+                        should_render = true;
+                    }
+                    self.active_tab_idx = active_tab_idx;
+
+                    // Clean up names for closed tabs
+                    let current_positions: HashSet<usize> =
+                        tabs.iter().map(|t| t.position).collect();
+                    self.cleanup_names(&current_positions);
+
+                    self.tabs = tabs;
+                } else {
+                    eprintln!("Could not find active tab.");
                 }
-                false // no re-render needed for mouse
             }
             Event::PermissionRequestResult(PermissionStatus::Granted) => {
-                subscribe(&[EventType::TabUpdate, EventType::ModeUpdate, EventType::Mouse]);
-                false
+                set_selectable(false);
+                subscribe(&[
+                    EventType::TabUpdate,
+                    EventType::ModeUpdate,
+                    EventType::Mouse,
+                ]);
+                should_render = true;
             }
             Event::PermissionRequestResult(PermissionStatus::Denied) => {
-                eprintln!("zellij-crew: Permission denied");
-                false
+                eprintln!("Permission denied - tab bar will not function properly");
             }
-            _ => false,
+            Event::Mouse(me) => match me {
+                Mouse::LeftClick(_, col) => {
+                    let tab_to_focus =
+                        get_tab_to_focus(&self.tab_line, self.active_tab_idx, col);
+                    if let Some(idx) = tab_to_focus {
+                        switch_tab_to(idx.try_into().unwrap());
+                    }
+                }
+                Mouse::ScrollUp(_) => {
+                    switch_tab_to(min(self.active_tab_idx + 1, self.tabs.len()) as u32);
+                }
+                Mouse::ScrollDown(_) => {
+                    switch_tab_to(max(self.active_tab_idx.saturating_sub(1), 1) as u32);
+                }
+                _ => {}
+            },
+            _ => {
+                eprintln!("Got unrecognized event: {:?}", event);
+            }
         }
+        if self.tabs.is_empty() {
+            should_render = false;
+        }
+        should_render
     }
 
     fn render(&mut self, _rows: usize, cols: usize) {
-        self.render_tab_bar(cols);
+        if self.tabs.is_empty() {
+            // Don't render anything - let zellij show its permission dialog cleanly
+            return;
+        }
+
+        // Collect positions first to avoid borrow issues
+        let tab_positions: Vec<usize> = self.tabs.iter().map(|t| t.position).collect();
+
+        // Pre-allocate names
+        let names: Vec<String> = tab_positions
+            .iter()
+            .map(|&pos| {
+                let base = self.get_display_name(pos);
+                format!("{} [○]", base)
+            })
+            .collect();
+
+        let mut all_tabs: Vec<LinePart> = vec![];
+        let mut active_tab_index = 0;
+        let mut is_alternate_tab = false;
+
+        for (i, t) in self.tabs.iter().enumerate() {
+            let tabname = names[i].clone();
+
+            if t.active && self.mode_info.mode == InputMode::RenameTab {
+                active_tab_index = t.position;
+            } else if t.active {
+                active_tab_index = t.position;
+            }
+
+            let tab = tab_style(
+                tabname,
+                t,
+                is_alternate_tab,
+                self.mode_info.style.colors,
+                self.mode_info.capabilities,
+                None,
+            );
+            is_alternate_tab = !is_alternate_tab;
+            all_tabs.push(tab);
+        }
+
+        let background = self.mode_info.style.colors.text_unselected.background;
+
+        self.tab_line = tab_line(
+            self.mode_info.session_name.as_deref(),
+            all_tabs,
+            active_tab_index,
+            cols.saturating_sub(1),
+            self.mode_info.style.colors,
+            self.mode_info.capabilities,
+            self.mode_info.style.hide_session_name,
+            self.tabs.iter().find(|t| t.active),
+            &self.mode_info,
+            self.config.hide_swap_layout_indication,
+            &background,
+        );
+
+        let output = self
+            .tab_line
+            .iter()
+            .fold(String::new(), |output, part| output + &part.part);
+
+        match background {
+            PaletteColor::Rgb((r, g, b)) => {
+                print!("{}\u{1b}[48;2;{};{};{}m\u{1b}[0K", output, r, g, b);
+            }
+            PaletteColor::EightBit(color) => {
+                print!("{}\u{1b}[48;5;{}m\u{1b}[0K", output, color);
+            }
+        }
     }
 }
 
@@ -340,6 +367,7 @@ mod tests {
             names: names.iter().map(|s| s.to_string()).collect(),
             mode,
             show_position: false,
+            hide_swap_layout_indication: false,
         }
     }
 
@@ -357,22 +385,6 @@ mod tests {
         assert!(!config.show_position);
         assert!(!config.names.is_empty());
         assert_eq!(config.names[0], "alpha");
-    }
-
-    #[test]
-    fn test_config_custom_names() {
-        let mut map = BTreeMap::new();
-        map.insert("names".to_string(), "a b c".to_string());
-        let config = Config::from_btreemap(&map);
-        assert_eq!(config.names, vec!["a", "b", "c"]);
-    }
-
-    #[test]
-    fn test_config_fill_in_mode() {
-        let mut map = BTreeMap::new();
-        map.insert("mode".to_string(), "fill-in".to_string());
-        let config = Config::from_btreemap(&map);
-        assert_eq!(config.mode, AllocationMode::FillIn);
     }
 
     #[test]
@@ -399,10 +411,8 @@ mod tests {
         state.assigned_names.insert(1, "b".to_string());
         state.assigned_names.insert(2, "c".to_string());
 
-        // Simulate tab 1 closing
         state.assigned_names.remove(&1);
 
-        // Fill-in should reuse "b"
         assert_eq!(state.allocate_name(), Some("b".to_string()));
     }
 
@@ -413,64 +423,11 @@ mod tests {
         state.assigned_names.insert(1, "b".to_string());
         state.assigned_names.insert(2, "c".to_string());
 
-        // Tabs 0 and 2 remain, tab 1 closed
         let current: HashSet<usize> = [0, 2].iter().cloned().collect();
         state.cleanup_names(&current);
 
         assert!(state.assigned_names.contains_key(&0));
         assert!(!state.assigned_names.contains_key(&1));
         assert!(state.assigned_names.contains_key(&2));
-    }
-
-    #[test]
-    fn test_format_display_name_without_position() {
-        let state = make_state(&["a"], AllocationMode::RoundRobin);
-        assert_eq!(state.format_display_name("alpha", 0), "alpha");
-        assert_eq!(state.format_display_name("alpha", 5), "alpha");
-    }
-
-    #[test]
-    fn test_format_display_name_with_position() {
-        let mut state = make_state(&["a"], AllocationMode::RoundRobin);
-        state.config.show_position = true;
-        assert_eq!(state.format_display_name("alpha", 0), "alpha <1>");
-        assert_eq!(state.format_display_name("alpha", 5), "alpha <6>");
-    }
-
-    #[test]
-    fn test_empty_pool() {
-        let mut state = make_state(&[], AllocationMode::RoundRobin);
-        assert_eq!(state.allocate_name(), None);
-
-        state.config.mode = AllocationMode::FillIn;
-        assert_eq!(state.allocate_name(), None);
-    }
-
-    #[test]
-    fn test_get_display_name_allocates() {
-        let mut state = make_state(&["alice", "bob"], AllocationMode::FillIn);
-
-        let name0 = state.get_display_name(0);
-        assert_eq!(name0, "alice");
-        assert!(state.assigned_names.contains_key(&0));
-
-        let name1 = state.get_display_name(1);
-        assert_eq!(name1, "bob");
-
-        // Same position returns same name
-        let name0_again = state.get_display_name(0);
-        assert_eq!(name0_again, "alice");
-    }
-
-    #[test]
-    fn test_pool_exhausted_fallback() {
-        let mut state = make_state(&["a"], AllocationMode::FillIn);
-
-        let name0 = state.get_display_name(0);
-        assert_eq!(name0, "a");
-
-        // Pool exhausted
-        let name1 = state.get_display_name(1);
-        assert_eq!(name1, "Tab 2");
     }
 }

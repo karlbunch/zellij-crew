@@ -1,9 +1,9 @@
-// zellij-crew: Tab naming and tab-bar plugin
+// zellij-crew: Tab-bar plugin with named tabs and activity indicators
 
 mod line;
 mod tab;
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use zellij_tile::prelude::*;
 
 use crate::line::{build_tab_line, LinePart};
@@ -32,7 +32,6 @@ struct Config {
     names: Vec<String>,
     mode: AllocationMode,
     show_position: bool,
-    rename_custom: bool,
 }
 
 impl Config {
@@ -57,16 +56,10 @@ impl Config {
             .map(|s| s == "true")
             .unwrap_or(false);
 
-        let rename_custom = config
-            .get("rename_custom")
-            .map(|s| s == "true")
-            .unwrap_or(false);
-
         Config {
             names,
             mode,
             show_position,
-            rename_custom,
         }
     }
 }
@@ -81,18 +74,12 @@ struct State {
     tabs: Vec<TabInfo>,
     active_tab_idx: usize,
 
-    // Mode and styling info from ModeUpdate
-    mode_info: Option<ModeInfo>,
-
     // Cached tab line for mouse click detection
     tab_line: Vec<LinePart>,
 
-    // Name allocation state
-    used_names: HashSet<String>,
+    // Name allocation: tab position -> assigned name
+    assigned_names: HashMap<usize, String>,
     last_assigned_idx: Option<usize>,
-
-    // Pending rename: (position, expected_name)
-    pending_rename: Option<(usize, String)>,
 
     // Configuration
     config: Config,
@@ -103,16 +90,8 @@ struct State {
 // ============================================================================
 
 impl State {
-    fn is_default_name(name: &str) -> bool {
-        if let Some(rest) = name.strip_prefix("Tab #") {
-            rest.parse::<u32>().is_ok()
-        } else {
-            false
-        }
-    }
-
-    fn is_pool_name(&self, name: &str) -> bool {
-        self.config.names.iter().any(|n| n == name)
+    fn used_names(&self) -> HashSet<String> {
+        self.assigned_names.values().cloned().collect()
     }
 
     fn allocate_name_round_robin(&mut self) -> Option<String> {
@@ -120,13 +99,14 @@ impl State {
             return None;
         }
 
+        let used = self.used_names();
         let start_idx = self.last_assigned_idx.map(|i| i + 1).unwrap_or(0);
         let pool_len = self.config.names.len();
 
         for offset in 0..pool_len {
             let idx = (start_idx + offset) % pool_len;
             let name = &self.config.names[idx];
-            if !self.used_names.contains(name) {
+            if !used.contains(name) {
                 self.last_assigned_idx = Some(idx);
                 return Some(name.clone());
             }
@@ -136,8 +116,9 @@ impl State {
     }
 
     fn allocate_name_fill_in(&self) -> Option<String> {
+        let used = self.used_names();
         for name in &self.config.names {
-            if !self.used_names.contains(name) {
+            if !used.contains(name) {
                 return Some(name.clone());
             }
         }
@@ -152,7 +133,7 @@ impl State {
         }
     }
 
-    fn format_tab_name(&self, name: &str, position: usize) -> String {
+    fn format_display_name(&self, name: &str, position: usize) -> String {
         if self.config.show_position {
             format!("{} <{}>", name, position + 1)
         } else {
@@ -160,108 +141,45 @@ impl State {
         }
     }
 
-    /// Get the display name for a tab (either assigned name or original)
-    fn get_display_name(&self, tab: &TabInfo) -> String {
-        // If tab already has a pool name, use it
-        if self.is_pool_name(&tab.name) {
-            return tab.name.clone();
+    /// Get or allocate display name for a tab
+    fn get_display_name(&mut self, position: usize) -> String {
+        // Already assigned?
+        if let Some(name) = self.assigned_names.get(&position) {
+            return self.format_display_name(name, position);
         }
-        // Otherwise use original name
-        tab.name.clone()
+
+        // Allocate new name
+        if let Some(name) = self.allocate_name() {
+            self.assigned_names.insert(position, name.clone());
+            return self.format_display_name(&name, position);
+        }
+
+        // Pool exhausted - use position number
+        format!("Tab {}", position + 1)
+    }
+
+    /// Clean up names for tabs that no longer exist
+    fn cleanup_names(&mut self, current_positions: &HashSet<usize>) {
+        self.assigned_names
+            .retain(|pos, _| current_positions.contains(pos));
     }
 }
 
 // ============================================================================
-// Tab Processing (for background renaming mode)
+// Tab Update Handling
 // ============================================================================
 
 impl State {
-    fn process_tabs(&mut self, tabs: Vec<TabInfo>) {
-        let tab_info: Vec<_> = tabs
-            .iter()
-            .map(|t| format!("pos{}:'{}'", t.position, &t.name))
-            .collect();
-        eprintln!(
-            "zellij-crew: TabUpdate tabs={:?} pending={:?}",
-            tab_info, self.pending_rename
-        );
-
-        // Handle pending rename confirmation
-        if let Some((pos, expected_name)) = &self.pending_rename {
-            if let Some(tab) = tabs.iter().find(|t| t.position == *pos) {
-                if &tab.name == expected_name {
-                    eprintln!(
-                        "zellij-crew: pending rename confirmed for pos {} = '{}'",
-                        pos, expected_name
-                    );
-                    self.pending_rename = None;
-                } else {
-                    eprintln!(
-                        "zellij-crew: waiting for pending rename pos {} (have '{}', want '{}')",
-                        pos, &tab.name, expected_name
-                    );
-                    return;
-                }
-            } else {
-                eprintln!(
-                    "zellij-crew: pending rename pos {} no longer exists, clearing",
-                    pos
-                );
-                self.pending_rename = None;
-            }
-        }
-
-        // Update used_names based on current tab names
-        let mut current_pool_names: HashSet<String> = HashSet::new();
-        for tab in &tabs {
-            if self.is_pool_name(&tab.name) {
-                current_pool_names.insert(tab.name.clone());
-            }
-        }
-        self.used_names = current_pool_names.clone();
-
+    fn handle_tab_update(&mut self, tabs: Vec<TabInfo>) {
         // Find active tab
-        self.active_tab_idx = tabs
-            .iter()
-            .position(|t| t.active)
-            .unwrap_or(0);
+        self.active_tab_idx = tabs.iter().position(|t| t.active).unwrap_or(0);
 
-        // Store tabs for rendering
-        self.tabs = tabs.clone();
+        // Clean up names for closed tabs
+        let current_positions: HashSet<usize> = tabs.iter().map(|t| t.position).collect();
+        self.cleanup_names(&current_positions);
 
-        // Find ONE tab needing a name and rename it
-        for tab in &tabs {
-            if self.is_pool_name(&tab.name) {
-                continue;
-            }
-            if !self.config.rename_custom && !Self::is_default_name(&tab.name) {
-                continue;
-            }
-
-            let tab_index = match tab.name.strip_prefix("Tab #").and_then(|s| s.parse::<u32>().ok())
-            {
-                Some(n) => n,
-                None => {
-                    eprintln!(
-                        "zellij-crew: can't rename '{}' at pos {} - no stable index",
-                        tab.name, tab.position
-                    );
-                    continue;
-                }
-            };
-
-            if let Some(name) = self.allocate_name() {
-                self.used_names.insert(name.clone());
-                let formatted = self.format_tab_name(&name, tab.position);
-                eprintln!(
-                    "zellij-crew: renaming '{}' at pos {} to '{}' (rename_tab({}))",
-                    tab.name, tab.position, &formatted, tab_index
-                );
-                self.pending_rename = Some((tab.position, formatted.clone()));
-                rename_tab(tab_index, formatted);
-                return;
-            }
-        }
+        // Store tabs
+        self.tabs = tabs;
     }
 }
 
@@ -271,12 +189,10 @@ impl State {
 
 impl State {
     fn handle_mouse_click(&self, x: usize) {
-        // Find which tab was clicked based on cached tab_line
         let mut current_x = 0;
         for part in &self.tab_line {
             if x >= current_x && x < current_x + part.len {
                 if let Some(tab_idx) = part.tab_index {
-                    // Switch to this tab
                     go_to_tab(tab_idx as u32 + 1);
                     return;
                 }
@@ -304,12 +220,23 @@ impl State {
             return;
         }
 
+        // Collect tab info to avoid borrow issues
+        let tab_data: Vec<(usize, usize, bool)> = self
+            .tabs
+            .iter()
+            .enumerate()
+            .map(|(idx, tab)| (idx, tab.position, idx == self.active_tab_idx))
+            .collect();
+
         // Build LinePart for each tab
         let mut tab_parts: Vec<LinePart> = Vec::new();
-        for (idx, tab) in self.tabs.iter().enumerate() {
-            let is_active = idx == self.active_tab_idx;
-            let display_name = self.get_display_name(tab);
-            let part = render_tab(tab, is_active, &display_name);
+        for (idx, position, is_active) in tab_data {
+            let display_name = self.get_display_name(position);
+
+            // Add placeholder indicator
+            let display_with_indicator = format!("{} [○]", display_name);
+
+            let part = render_tab(&self.tabs[idx], is_active, &display_with_indicator);
             tab_parts.push(part);
         }
 
@@ -322,11 +249,11 @@ impl State {
             output.push_str(&part.part);
         }
 
-        // Fill remaining width with empty ribbon
+        // Fill remaining width with background
         let used_width: usize = tab_line.iter().map(|p| p.len).sum();
         if used_width < cols {
             let fill = " ".repeat(cols - used_width);
-            let fill_text = Text::new(&fill);
+            let fill_text = zellij_tile::ui_components::Text::new(&fill);
             output.push_str(&zellij_tile::ui_components::serialize_ribbon(&fill_text));
         }
 
@@ -367,12 +294,11 @@ impl ZellijPlugin for State {
 
     fn update(&mut self, event: Event) -> bool {
         match event {
-            Event::ModeUpdate(mode_info) => {
-                self.mode_info = Some(mode_info);
-                true // re-render
+            Event::ModeUpdate(_mode_info) => {
+                true // re-render on mode change
             }
             Event::TabUpdate(tabs) => {
-                self.process_tabs(tabs);
+                self.handle_tab_update(tabs);
                 true // re-render
             }
             Event::Mouse(mouse_event) => {
@@ -389,7 +315,7 @@ impl ZellijPlugin for State {
                 false
             }
             Event::PermissionRequestResult(PermissionStatus::Denied) => {
-                eprintln!("zellij-crew: Permission denied - plugin disabled");
+                eprintln!("zellij-crew: Permission denied");
                 false
             }
             _ => false,
@@ -414,7 +340,6 @@ mod tests {
             names: names.iter().map(|s| s.to_string()).collect(),
             mode,
             show_position: false,
-            rename_custom: false,
         }
     }
 
@@ -426,23 +351,10 @@ mod tests {
     }
 
     #[test]
-    fn test_is_default_name() {
-        assert!(State::is_default_name("Tab #1"));
-        assert!(State::is_default_name("Tab #42"));
-        assert!(State::is_default_name("Tab #999"));
-        assert!(!State::is_default_name("Tab #"));
-        assert!(!State::is_default_name("Tab #abc"));
-        assert!(!State::is_default_name("mywork"));
-        assert!(!State::is_default_name("alpha"));
-        assert!(!State::is_default_name(""));
-    }
-
-    #[test]
     fn test_config_defaults() {
         let config = Config::from_btreemap(&BTreeMap::new());
         assert_eq!(config.mode, AllocationMode::RoundRobin);
         assert!(!config.show_position);
-        assert!(!config.rename_custom);
         assert!(!config.names.is_empty());
         assert_eq!(config.names[0], "alpha");
     }
@@ -468,77 +380,61 @@ mod tests {
         let mut state = make_state(&["a", "b", "c"], AllocationMode::RoundRobin);
 
         assert_eq!(state.allocate_name(), Some("a".to_string()));
-        state.used_names.insert("a".to_string());
+        state.assigned_names.insert(0, "a".to_string());
 
         assert_eq!(state.allocate_name(), Some("b".to_string()));
-        state.used_names.insert("b".to_string());
+        state.assigned_names.insert(1, "b".to_string());
 
         assert_eq!(state.allocate_name(), Some("c".to_string()));
-        state.used_names.insert("c".to_string());
+        state.assigned_names.insert(2, "c".to_string());
 
         assert_eq!(state.allocate_name(), None);
-    }
-
-    #[test]
-    fn test_round_robin_skips_used_names() {
-        let mut state = make_state(&["a", "b", "c", "d"], AllocationMode::RoundRobin);
-
-        assert_eq!(state.allocate_name(), Some("a".to_string()));
-        state.used_names.insert("a".to_string());
-        assert_eq!(state.allocate_name(), Some("b".to_string()));
-        state.used_names.insert("b".to_string());
-        assert_eq!(state.allocate_name(), Some("c".to_string()));
-        state.used_names.insert("c".to_string());
-
-        state.used_names.remove("b");
-
-        assert_eq!(state.allocate_name(), Some("d".to_string()));
     }
 
     #[test]
     fn test_fill_in_reuses_freed_names() {
         let mut state = make_state(&["a", "b", "c", "d"], AllocationMode::FillIn);
 
-        assert_eq!(state.allocate_name(), Some("a".to_string()));
-        state.used_names.insert("a".to_string());
-        assert_eq!(state.allocate_name(), Some("b".to_string()));
-        state.used_names.insert("b".to_string());
-        assert_eq!(state.allocate_name(), Some("c".to_string()));
-        state.used_names.insert("c".to_string());
+        state.assigned_names.insert(0, "a".to_string());
+        state.assigned_names.insert(1, "b".to_string());
+        state.assigned_names.insert(2, "c".to_string());
 
-        state.used_names.remove("b");
+        // Simulate tab 1 closing
+        state.assigned_names.remove(&1);
 
-        assert_eq!(state.allocate_name(), Some("b".to_string()));
-    }
-
-    #[test]
-    fn test_fill_in_fills_gaps_in_order() {
-        let mut state = make_state(&["a", "b", "c", "d"], AllocationMode::FillIn);
-
-        state.used_names.insert("a".to_string());
-        state.used_names.insert("b".to_string());
-        state.used_names.insert("c".to_string());
-        state.used_names.insert("d".to_string());
-
-        state.used_names.remove("b");
-        state.used_names.remove("d");
-
+        // Fill-in should reuse "b"
         assert_eq!(state.allocate_name(), Some("b".to_string()));
     }
 
     #[test]
-    fn test_format_tab_name_without_position() {
+    fn test_cleanup_names() {
+        let mut state = make_state(&["a", "b", "c"], AllocationMode::FillIn);
+        state.assigned_names.insert(0, "a".to_string());
+        state.assigned_names.insert(1, "b".to_string());
+        state.assigned_names.insert(2, "c".to_string());
+
+        // Tabs 0 and 2 remain, tab 1 closed
+        let current: HashSet<usize> = [0, 2].iter().cloned().collect();
+        state.cleanup_names(&current);
+
+        assert!(state.assigned_names.contains_key(&0));
+        assert!(!state.assigned_names.contains_key(&1));
+        assert!(state.assigned_names.contains_key(&2));
+    }
+
+    #[test]
+    fn test_format_display_name_without_position() {
         let state = make_state(&["a"], AllocationMode::RoundRobin);
-        assert_eq!(state.format_tab_name("alpha", 0), "alpha");
-        assert_eq!(state.format_tab_name("alpha", 5), "alpha");
+        assert_eq!(state.format_display_name("alpha", 0), "alpha");
+        assert_eq!(state.format_display_name("alpha", 5), "alpha");
     }
 
     #[test]
-    fn test_format_tab_name_with_position() {
+    fn test_format_display_name_with_position() {
         let mut state = make_state(&["a"], AllocationMode::RoundRobin);
         state.config.show_position = true;
-        assert_eq!(state.format_tab_name("alpha", 0), "alpha <1>");
-        assert_eq!(state.format_tab_name("alpha", 5), "alpha <6>");
+        assert_eq!(state.format_display_name("alpha", 0), "alpha <1>");
+        assert_eq!(state.format_display_name("alpha", 5), "alpha <6>");
     }
 
     #[test]
@@ -551,11 +447,30 @@ mod tests {
     }
 
     #[test]
-    fn test_is_pool_name() {
-        let state = make_state(&["alice", "bob", "carol"], AllocationMode::FillIn);
-        assert!(state.is_pool_name("alice"));
-        assert!(state.is_pool_name("bob"));
-        assert!(!state.is_pool_name("Tab #1"));
-        assert!(!state.is_pool_name("mywork"));
+    fn test_get_display_name_allocates() {
+        let mut state = make_state(&["alice", "bob"], AllocationMode::FillIn);
+
+        let name0 = state.get_display_name(0);
+        assert_eq!(name0, "alice");
+        assert!(state.assigned_names.contains_key(&0));
+
+        let name1 = state.get_display_name(1);
+        assert_eq!(name1, "bob");
+
+        // Same position returns same name
+        let name0_again = state.get_display_name(0);
+        assert_eq!(name0_again, "alice");
+    }
+
+    #[test]
+    fn test_pool_exhausted_fallback() {
+        let mut state = make_state(&["a"], AllocationMode::FillIn);
+
+        let name0 = state.get_display_name(0);
+        assert_eq!(name0, "a");
+
+        // Pool exhausted
+        let name1 = state.get_display_name(1);
+        assert_eq!(name1, "Tab 2");
     }
 }

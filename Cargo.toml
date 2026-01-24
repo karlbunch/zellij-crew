@@ -5,9 +5,6 @@ edition = "2021"
 license = "MIT"
 description = "Zellij plugin that auto-renames tabs with names from a configurable pool"
 
-[lib]
-crate-type = ["cdylib"]
-
 [dependencies]
 zellij-tile = "0.43"
 zellij-tile-utils = "0.43"

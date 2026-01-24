@@ -1,7 +1,5 @@
 // Line layout and LinePart utilities for tab-bar rendering
 
-use unicode_width::UnicodeWidthStr;
-
 /// A styled segment of the tab line with its visual width.
 /// Pairs ANSI-styled content with width for layout calculations.
 #[derive(Debug, Clone, Default)]
@@ -12,54 +10,6 @@ pub struct LinePart {
     pub len: usize,
     /// Tab index for mouse click detection (None for non-tab elements)
     pub tab_index: Option<usize>,
-}
-
-impl LinePart {
-    pub fn new(part: String, len: usize) -> Self {
-        Self {
-            part,
-            len,
-            tab_index: None,
-        }
-    }
-
-    pub fn with_tab_index(mut self, index: usize) -> Self {
-        self.tab_index = Some(index);
-        self
-    }
-}
-
-/// Calculate the visual width of a string (excluding ANSI escape sequences)
-pub fn str_visual_width(s: &str) -> usize {
-    // Strip ANSI codes before measuring
-    let stripped = strip_ansi_codes(s);
-    UnicodeWidthStr::width(stripped.as_str())
-}
-
-/// Strip ANSI escape sequences from a string
-pub fn strip_ansi_codes(s: &str) -> String {
-    let mut result = String::with_capacity(s.len());
-    let mut chars = s.chars().peekable();
-
-    while let Some(c) = chars.next() {
-        if c == '\x1b' {
-            // Skip escape sequence
-            if chars.peek() == Some(&'[') {
-                chars.next(); // consume '['
-                // Skip until we hit a letter (end of sequence)
-                while let Some(&next) = chars.peek() {
-                    chars.next();
-                    if next.is_ascii_alphabetic() {
-                        break;
-                    }
-                }
-            }
-        } else {
-            result.push(c);
-        }
-    }
-
-    result
 }
 
 /// Build the complete tab line, handling overflow when tabs don't fit.
@@ -174,32 +124,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_strip_ansi_codes() {
-        assert_eq!(strip_ansi_codes("hello"), "hello");
-        assert_eq!(strip_ansi_codes("\x1b[31mred\x1b[0m"), "red");
-        assert_eq!(
-            strip_ansi_codes("\x1b[1;32mbold green\x1b[0m"),
-            "bold green"
-        );
-    }
-
-    #[test]
-    fn test_str_visual_width() {
-        assert_eq!(str_visual_width("hello"), 5);
-        assert_eq!(str_visual_width("\x1b[31mred\x1b[0m"), 3);
-    }
-
-    #[test]
-    fn test_line_part_with_tab_index() {
-        let part = LinePart::new("test".to_string(), 4).with_tab_index(2);
-        assert_eq!(part.tab_index, Some(2));
-    }
-
-    #[test]
     fn test_build_tab_line_fits() {
         let tabs = vec![
-            LinePart::new("tab1".to_string(), 4),
-            LinePart::new("tab2".to_string(), 4),
+            LinePart { part: "tab1".to_string(), len: 4, tab_index: Some(0) },
+            LinePart { part: "tab2".to_string(), len: 4, tab_index: Some(1) },
         ];
         let result = build_tab_line(tabs, 0, 100);
         assert_eq!(result.len(), 2);

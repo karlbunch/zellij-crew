@@ -32,15 +32,6 @@ pub fn render_tab(
     }
 }
 
-/// Render activity indicator for a tab (placeholder for Phase 2b)
-pub fn render_activity_indicator(
-    _tab_position: usize,
-) -> Option<LinePart> {
-    // TODO: Phase 2b will implement this based on TabState
-    // For now, no indicators
-    None
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

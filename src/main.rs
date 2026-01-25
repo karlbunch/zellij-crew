@@ -338,7 +338,6 @@ impl ZellijPlugin for State {
             EventType::ModeUpdate,
             EventType::Mouse,
             EventType::PermissionRequestResult,
-            EventType::CustomMessage,
         ]);
     }
 
@@ -409,26 +408,8 @@ impl ZellijPlugin for State {
                     _ => {}
                 }
             }
-            Event::CustomMessage(message, payload) => {
-                eprintln!("[crew] CustomMessage received: is_leader={} message='{}' payload_len={}",
-                    self.is_leader, message, payload.len());
-
-                if !self.is_leader && message == "crew-state" {
-                    // Renderer: receive state from leader
-                    match serde_json::from_str::<Vec<CrewTabState>>(&payload) {
-                        Ok(tabs) => {
-                            eprintln!("[crew:renderer] Received state: {} tabs", tabs.len());
-                            self.received_tabs = tabs;
-                            should_render = true;
-                        }
-                        Err(e) => {
-                            eprintln!("[crew:renderer] ERROR: Failed to parse state: {}", e);
-                        }
-                    }
-                }
-            }
             _ => {
-                eprintln!("Got unrecognized event: {:?}", event);
+                eprintln!("[crew] Got unrecognized event: {:?}", event);
             }
         }
         if self.tabs.is_empty() {

@@ -14,6 +14,53 @@ The WASM binary will be at `target/wasm32-wasip1/release/zellij_crew.wasm`.
 
 Copy it to your zellij plugins directory or reference it directly in your configuration.
 
+## Architecture
+
+Crew uses a **leader/renderer architecture**:
+
+- **Leader** (loaded via `load_plugins`): Manages tab names, handles renames, tracks state
+- **Renderers** (loaded per-tab in layout): Display tab bar with names from leader
+
+This architecture allows multiple tab-bar instances while maintaining a single source of truth for tab names.
+
+## Usage
+
+**1. Configure in config.kdl:**
+
+```kdl
+plugins {
+    crew location="file:~/.config/zellij/zellij-crew.wasm" {
+        names "Alice Bob Carol Dave Emma Frank Grace Henry Ivy Jack"
+        mode "fill-in"
+    }
+}
+
+load_plugins {
+    "crew"  # Leader instance (background)
+}
+```
+
+**2. Use in layout (optional):**
+
+```kdl
+layout {
+    default_tab_template {
+        pane size=1 borderless=true {
+            plugin location="crew"  # Renderer per tab
+        }
+        children
+        pane size=1 borderless=true {
+            plugin location="status-bar"
+        }
+    }
+}
+```
+
+Save as `~/.config/zellij/layouts/crew-bar.kdl` and start with:
+```bash
+zellij --layout crew-bar
+```
+
 ## Configuration
 
 Add to your zellij config (`~/.config/zellij/config.kdl`):

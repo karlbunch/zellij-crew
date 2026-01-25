@@ -71,7 +71,8 @@ struct State {
     active_tab_idx: usize,        // Currently focused tab
 
     // Name allocation
-    assigned_names: HashMap<u32, String>,  // tab_id -> assigned name
+    // CRITICAL: Track by tab.name (stable) not position (shifts on tab close)
+    assigned_names: HashMap<String, String>,  // tab.name -> crew_name (e.g., "Tab #1" -> "alpha")
     last_assigned_idx: usize,     // For round-robin mode: index of last assigned name
 
     // Configuration
@@ -99,48 +100,66 @@ enum AllocationMode {
 2. **update()**: Handle events (primarily `TabUpdate`)
 3. **render()**: Not used for tab renaming (we use actions, not UI)
 
-### Tab Rename Flow
+### Tab Rename Flow (Leader Only)
+
+Only the leader instance handles renaming. Renderers never call rename_tab().
 
 ```
-TabUpdate event received
+TabUpdate event received (LEADER ONLY)
     │
     ├─► For each tab in update:
     │       │
-    │       ├─► Tab already has assigned name?
-    │       │       YES → Skip (unless show_position changed)
-    │       │       NO  → Continue
+    │       ├─► Tab name in known_tabs?
+    │       │       YES → Update TabState, skip rename
+    │       │       NO  → Continue (new tab)
     │       │
-    │       ├─► Tab has custom name AND !rename_custom?
-    │       │       YES → Skip
-    │       │       NO  → Continue
+    │       ├─► Is default name "Tab #N"?
+    │       │       YES → Parse tab_id from name, allocate from pool
+    │       │             rename_tab(tab_id, new_name)
+    │       │             Add to known_tabs with user_defined: false
+    │       │       NO  → User named it, accept as-is
+    │       │             Add to known_tabs with user_defined: true
     │       │
-    │       └─► Allocate name based on mode
-    │               │
-    │               ├─► round-robin: names[(last_assigned_idx + 1) % len]
-    │               └─► fill-in: first name not in assigned_names.values()
+    │       └─► Broadcast updated TabState to renderers
     │
-    └─► For each newly assigned name:
+    └─► For tabs no longer present (closed):
             │
-            └─► Send RenameTab action with formatted name
+            ├─► If user_defined: false → name returns to pool
+            └─► Remove from known_tabs
 ```
 
-### Detecting "Custom" vs "Default" Tab Names
+### Parsing Default Tab Names
 
-A tab has a default name if it matches the pattern `Tab #N` where N is a number. All other names are considered custom (user-set).
+Default names follow pattern `Tab #N` where N is the **tab ID needed for rename_tab()**.
+This is a workaround for the plugin API not exposing tab IDs directly.
 
 ```rust
-fn is_default_name(name: &str) -> bool {
-    name.starts_with("Tab #") && name[5..].parse::<u32>().is_ok()
+fn parse_default_name(name: &str) -> Option<u32> {
+    // "Tab #5" → Some(5) (the tab_id for rename_tab)
+    if name.starts_with("Tab #") {
+        name[5..].parse().ok()
+    } else {
+        None
+    }
 }
 ```
+
+### Avoiding Rename Loops
+
+The leader tracks all known tab names. When TabUpdate arrives after a rename:
+1. Tab now has name "alice" (we renamed it)
+2. Leader checks: is "alice" in known_tabs? YES → skip
+3. No rename loop
+
+User-renamed tabs are also tracked (with `user_defined: true`) so we don't try to rename them.
 
 ## Actions
 
 The plugin uses zellij's action system to rename tabs:
 
 ```rust
-// Rename the tab at a specific index
-rename_tab(tab_index: u32, new_name: String)
+// Rename tab using ID parsed from "Tab #N"
+rename_tab(tab_id: u32, new_name: String)
 ```
 
 ## Permissions
@@ -264,6 +283,114 @@ Visual indicators include:
 
 ## Architecture
 
+### Leader/Renderer Architecture
+
+#### Discovery: Single Plugin, Dual Mode
+
+Through testing, we discovered that a single plugin binary can detect whether it was loaded
+via `load_plugins` (background) or in a layout pane (tab-bar), enabling a leader/renderer pattern:
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│              LEADER (load_plugins, background)              │
+│  - Detected by: first render has rows > 1                   │
+│  - Manages name assignments + activity state                │
+│  - Handles rename_tab() calls (no races)                    │
+│  - Broadcasts CrewState via pipe messages                   │
+│  - Plugin ID is typically lowest (e.g., id: 1)              │
+└─────────────────────────────────────────────────────────────┘
+                            │
+                            ▼ pipe: crew-state (broadcast)
+        ┌───────────────────┼───────────────────┐
+        ▼                   ▼                   ▼
+   [crew-bar 1]        [crew-bar 2]        [crew-bar N]
+   is_leader=false     is_leader=false     is_leader=false
+   rows=1 (tab-bar)    rows=1 (tab-bar)    rows=1 (tab-bar)
+   Stateless render    Stateless render    Stateless render
+```
+
+#### Leader Detection Mechanism
+
+The load_plugins instance receives a larger virtual pane on first render, even when
+permissions are already cached. Tab-bar instances get rows ≤ 1:
+
+```rust
+fn render(&mut self, rows: usize, cols: usize) {
+    if !self.first_render_done {
+        self.first_render_done = true;
+        self.is_leader = rows > 1;  // load_plugins gets rows=20, tab-bar gets rows=0 or 1
+    }
+
+    if self.is_leader {
+        // Don't render anything - background instance
+        // Handle state management, broadcast via pipe
+        return;
+    }
+
+    // Renderer mode - draw tab bar from received state
+}
+```
+
+**Test Results:**
+```
+[id: 1] FIRST render() rows=20 cols=88 is_leader=true   <- load_plugins
+[id: 2] FIRST render() rows=0 cols=180 is_leader=false  <- tab-bar
+[id: 4] FIRST render() rows=0 cols=180 is_leader=false  <- new tab's tab-bar
+```
+
+#### Configuration
+
+**config.kdl** - Load the leader instance:
+```kdl
+plugins {
+    crew location="file:~/.config/zellij/zellij-crew.wasm" {
+        names "Alice Bob Carol ..."
+        mode "fill-in"
+    }
+}
+
+load_plugins {
+    "crew"  # Background leader instance
+}
+```
+
+**layouts/crew-bar.kdl** - Load renderer instances per tab:
+```kdl
+layout {
+    default_tab_template {
+        pane size=1 borderless=true {
+            plugin location="crew"  # Renderer in each tab
+        }
+        children
+        pane size=1 borderless=true {
+            plugin location="status-bar"
+        }
+    }
+}
+```
+
+#### Why This Works (Like Focus Indicators)
+
+This mirrors how zellij's built-in focus indicators work:
+- Server maintains authoritative state (which client focuses which tab)
+- Server broadcasts via TabInfo.other_focused_clients
+- Each tab-bar instance renders the same thing (stateless)
+
+For crew:
+- Leader maintains authoritative state (name assignments, activity)
+- Leader broadcasts via pipe messages
+- Each renderer instance renders from received state (stateless)
+
+#### Tab Name Stability
+
+After `rename_tab()` succeeds:
+- `tab.name` changes from "Tab #1" to "alpha"
+- Name is now STABLE across position changes
+- When middle tab closes, remaining tabs keep their names
+- Track assigned names by `tab.name` (not position)
+
+This solves the original position-based bug where names would shift when middle tabs closed.
+
 ### Core Principle: Separation of Concerns
 
 ```
@@ -301,23 +428,28 @@ Visual indicators include:
 └─────────────────────────────────────────────────────────────────┘
 ```
 
-### TabState: The Truth Store
+### TabState: The Truth Store (Leader Only)
 
-TabState is the central data structure that holds the current state of each pane. It doesn't care where signals come from - it just maintains truth.
+The leader maintains TabState for all tabs. This is the single source of truth that gets
+broadcast to renderers. Renderers are stateless - they just paint what the leader tells them.
 
 ```rust
+// Leader's state
+struct LeaderState {
+    tabs: HashMap<String, TabState>,  // Keyed by tab name
+    name_pool: Vec<String>,           // Configured name pool
+    last_assigned_idx: usize,         // For round-robin mode
+}
+
 struct TabState {
-    panes: HashMap<PaneId, PaneState>,
+    name: String,               // The tab's current name
+    user_defined: bool,         // true = user named it, false = we assigned from pool
+    status: ActivityStatus,     // Current activity state
+    source: SignalSource,       // How we know the status
+    last_activity: Instant,     // For timeout/sleeping detection
 }
 
-struct PaneState {
-    status: PaneStatus,
-    source: SignalSource,       // How we know this state
-    last_activity: Instant,     // When we last saw output
-    last_updated: Instant,      // When state last changed
-}
-
-enum PaneStatus {
+enum ActivityStatus {
     Unknown,                    // Just opened, no data yet
     Idle,                       // At shell prompt, waiting for input
     Running,                    // Command executing, output flowing
@@ -332,6 +464,44 @@ enum SignalSource {
     ContentMatch,               // Regex matched prompt (medium confidence)
     Timeout,                    // Inferred from silence (low confidence)
     None,                       // No signal yet
+}
+```
+
+### Name Pool Management
+
+When a tab closes:
+- If `user_defined: false` → name returns to pool (available for fill-in mode)
+- If `user_defined: true` → name is discarded (was user's choice, don't reuse)
+
+```rust
+fn on_tab_closed(&mut self, name: &str) {
+    if let Some(tab) = self.tabs.remove(name) {
+        if !tab.user_defined && self.name_pool.contains(&tab.name) {
+            // Pool name available again for fill-in
+        }
+        // User-defined names just disappear
+    }
+    self.broadcast_state();
+}
+```
+
+### Renderer State
+
+Renderers maintain no state of their own. They receive TabState from the leader and render:
+
+```rust
+// Renderer receives broadcast from leader
+fn render_tabs(&self, tabs: &[TabState], config: &Config) {
+    for tab in tabs {
+        let indicator = match tab.status {
+            ActivityStatus::Idle => &config.indicator_idle,
+            ActivityStatus::Working => &config.indicator_working,
+            ActivityStatus::Question => &config.indicator_question,
+            // etc.
+        };
+        // Output: "Alice [●]"
+        print_tab(&tab.name, indicator);
+    }
 }
 ```
 

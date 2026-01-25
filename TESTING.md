@@ -10,15 +10,17 @@
 2. Create a test layout file (`test-layout.kdl`):
    ```kdl
    layout {
-       pane
-       pane {
+       pane size=1 borderless=true {
            plugin location="file:target/wasm32-wasip1/release/zellij_crew.wasm" {
                names "alice bob carol dave eve"
                mode "round-robin"
-               show_position "false"
-               rename_custom "false"
            }
        }
+       pane size=1 borderless=true {
+           plugin location="status-bar"
+       }
+
+       tab  # CRITICAL: Explicit tab for session-level loading
    }
    ```
 
@@ -81,6 +83,14 @@
 1. Start zellij without plugin, create several tabs with default names
 2. Load the plugin
 3. Expected: All existing tabs with default names get renamed
+
+### T8: Verify Single Instance
+
+1. Start with test layout
+2. Check logs: `tail -f /tmp/zellij-*/zellij-log/zellij.log | grep crew`
+3. Create multiple tabs
+4. Expected: All log lines show SAME plugin ID (e.g., `[crew:1]`)
+5. If multiple IDs appear (1, 6, 8), layout is broken (per-tab loading)
 
 ## Debugging
 

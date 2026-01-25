@@ -428,44 +428,51 @@ This solves the original position-based bug where names would shift when middle 
 └─────────────────────────────────────────────────────────────────┘
 ```
 
-### TabState: The Truth Store (Leader Only)
+### CrewTabState: The Truth Store (Leader Only)
 
-The leader maintains TabState for all tabs. This is the single source of truth that gets
+The leader maintains CrewTabState for all tabs. This is the single source of truth that gets
 broadcast to renderers. Renderers are stateless - they just paint what the leader tells them.
 
 ```rust
 // Leader's state
-struct LeaderState {
-    tabs: HashMap<String, TabState>,  // Keyed by tab name
-    name_pool: Vec<String>,           // Configured name pool
-    last_assigned_idx: usize,         // For round-robin mode
+struct State {
+    known_tabs: HashMap<u32, CrewTabState>,  // Keyed by stable tab_id
+    last_assigned_idx: Option<usize>,        // For round-robin mode
+    config: Config,                          // Name pool, mode, etc.
 }
 
-struct TabState {
-    name: String,               // The tab's current name
-    user_defined: bool,         // true = user named it, false = we assigned from pool
-    status: ActivityStatus,     // Current activity state
-    source: SignalSource,       // How we know the status
-    last_activity: Instant,     // For timeout/sleeping detection
+struct CrewTabState {
+    tab_id: u32,                     // Stable ID from "Tab #N" (explicit, no iteration needed)
+    name: String,                    // Current name ("Alice" after rename, "Tab #5" before)
+    pending_rename: Option<String>,  // Some("Alice") when rename sent, waiting for confirmation
+    user_defined: bool,              // true = user named it, false = from our pool
+    status: ActivityStatus,          // Current activity state
 }
 
 enum ActivityStatus {
     Unknown,                    // Just opened, no data yet
     Idle,                       // At shell prompt, waiting for input
-    Running,                    // Command executing, output flowing
     Working,                    // Agent actively processing (from hook)
-    Waiting,                    // Waiting for user input
     Question,                   // Agent asked a question
-    Sleeping,                   // No activity for N seconds (uncertainty)
-}
-
-enum SignalSource {
-    Pipe,                       // Explicit message (highest confidence)
-    ContentMatch,               // Regex matched prompt (medium confidence)
-    Timeout,                    // Inferred from silence (low confidence)
-    None,                       // No signal yet
+    // Future: Running, Waiting, Sleeping, etc.
 }
 ```
+
+**Why tab_id as HashMap key:**
+
+- Tab IDs are stable (never change, even when tabs close/reorder)
+- Parsed from "Tab #N" default name
+- Needed for `rename_tab(tab_id, name)` API anyway
+- Storing in struct too (redundant with key) for self-documentation
+
+**Why pending_rename flag:**
+
+Prevents infinite rename loops:
+1. Leader calls `rename_tab(5, "Alice")`, sets `pending_rename: Some("Alice")`
+2. Next TabUpdate still has "Tab #5" (rename not confirmed yet)
+3. Leader sees tab_id=5 in known_tabs with pending_rename → skip
+4. Later TabUpdate has "Alice" → match against pending_rename, confirm, clear flag
+5. No re-renaming, no loops
 
 ### Name Pool Management
 
@@ -487,11 +494,11 @@ fn on_tab_closed(&mut self, name: &str) {
 
 ### Renderer State
 
-Renderers maintain no state of their own. They receive TabState from the leader and render:
+Renderers maintain no state of their own. They receive CrewTabState from the leader and render:
 
 ```rust
 // Renderer receives broadcast from leader
-fn render_tabs(&self, tabs: &[TabState], config: &Config) {
+fn render_tabs(&self, tabs: &[CrewTabState], config: &Config) {
     for tab in tabs {
         let indicator = match tab.status {
             ActivityStatus::Idle => &config.indicator_idle,
@@ -505,6 +512,56 @@ fn render_tabs(&self, tabs: &[TabState], config: &Config) {
 }
 ```
 
+### Leader-to-Renderer Pipe Communication
+
+The leader broadcasts state to all renderer instances using zellij's pipe messaging system.
+
+**Implementation Requirements:**
+
+1. **Permission**: Request `PermissionType::MessageAndLaunchOtherPlugins` in load()
+2. **ZellijPlugin trait**: Implement `fn pipe(&mut self, PipeMessage) -> bool` method
+3. **Broadcasting**: Use `pipe_message_to_plugin()` with `with_plugin_url("crew")`
+
+**Leader broadcast code:**
+
+```rust
+fn broadcast_state(&self) {
+    let tabs: Vec<&CrewTabState> = self.known_tabs.values().collect();
+
+    if let Ok(json) = serde_json::to_string(&tabs) {
+        pipe_message_to_plugin(
+            MessageToPlugin::new("crew-state")
+                .with_plugin_url("crew")  // Routes to ALL instances with URL "crew"
+                .with_payload(json)
+        );
+    }
+}
+```
+
+**Renderer receive code:**
+
+```rust
+fn pipe(&mut self, pipe_message: PipeMessage) -> bool {
+    if !self.is_leader && pipe_message.name == "crew-state" {
+        if let Some(payload) = pipe_message.payload {
+            if let Ok(tabs) = serde_json::from_str::<Vec<CrewTabState>>(&payload) {
+                self.received_tabs = tabs;
+                return true;  // Request render
+            }
+        }
+    }
+    false
+}
+```
+
+**Key Insights:**
+
+- `pipe()` method (not `update()` with CustomMessage events)
+- `with_plugin_url("crew")` without `with_destination_plugin_id()` = broadcast to all instances
+- PipeMessage.source is `Plugin(leader_id)` when sent from plugin
+- All crew instances (leader + renderers) receive the message, filter by `is_leader` flag
+- No registration needed - zellij routes by plugin URL automatically
+
 ### Signal Priority
 
 Explicit signals always override inferred state:
@@ -515,7 +572,25 @@ effective_state = pipe_signal ?? content_match ?? timeout_inference ?? Unknown
 
 When a pipe message arrives, it immediately sets state and clears any inferred state. Content analysis only runs when there's no recent explicit signal. Timeout detection only kicks in when we have no other information.
 
-## Pipe Protocol
+## Pipe Protocols
+
+crew uses two separate pipe namespaces:
+
+1. **crew-state** (internal): Leader → Renderers state broadcast
+2. **zellij-crew:status** (external): External sources → Leader activity updates
+
+### Internal Pipe: crew-state
+
+Used by the leader to broadcast CrewTabState to all renderer instances. See "Leader-to-Renderer Pipe Communication" section above.
+
+- **Name**: `crew-state`
+- **Payload**: JSON array of CrewTabState objects
+- **Direction**: Leader → All Renderers
+- **Trigger**: Every TabUpdate that changes state
+
+### External Pipe: zellij-crew:status
+
+Used by external tools (Claude Code, shell hooks, etc.) to update activity status.
 
 Namespace: `zellij-crew:status` (not `crew-bar` - the plugin may evolve beyond just the bar)
 

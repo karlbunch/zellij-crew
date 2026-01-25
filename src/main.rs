@@ -8,6 +8,7 @@ use std::cmp::{max, min};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::convert::TryInto;
 
+use serde::{Deserialize, Serialize};
 use tab::get_tab_to_focus;
 use zellij_tile::prelude::*;
 
@@ -100,7 +101,7 @@ impl Config {
 // Plugin State
 // ============================================================================
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 enum ActivityStatus {
     Unknown,
     Idle,
@@ -114,10 +115,11 @@ impl Default for ActivityStatus {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct CrewTabState {
     tab_id: u32,                     // Stable ID from "Tab #N" (redundant with HashMap key but explicit)
     name: String,                    // Current name ("Alice" after rename, "Tab #5" before)
+    #[serde(skip)]                   // Don't serialize internal rename tracking
     pending_rename: Option<String>,  // Some("Alice") when rename sent, waiting for confirmation
     user_defined: bool,              // true if user named it, false if from our pool
     status: ActivityStatus,          // Current activity status
@@ -160,6 +162,27 @@ fn parse_default_name(name: &str) -> Option<u32> {
 // ============================================================================
 
 impl State {
+    fn broadcast_state(&self) {
+        if !self.is_leader {
+            return; // Only leader broadcasts
+        }
+
+        let tabs: Vec<&CrewTabState> = self.known_tabs.values().collect();
+
+        if let Ok(json) = serde_json::to_string(&tabs) {
+            eprintln!("[crew:leader] Broadcasting state: {} tabs", tabs.len());
+
+            // Send to all crew instances via plugin_url
+            pipe_message_to_plugin(
+                MessageToPlugin::new("crew-state")
+                    .with_plugin_url("crew")  // Routes to all instances with this URL
+                    .with_payload(json)
+            );
+        } else {
+            eprintln!("[crew:leader] ERROR: Failed to serialize state");
+        }
+    }
+
     fn allocate_from_pool(&mut self) -> Option<String> {
         if self.config.names.is_empty() {
             return None;
@@ -282,6 +305,9 @@ impl State {
                 }
             }
         }
+
+        // Broadcast updated state to renderers
+        self.broadcast_state();
     }
 }
 
@@ -297,19 +323,22 @@ impl ZellijPlugin for State {
     fn load(&mut self, configuration: BTreeMap<String, String>) {
         self.config = Config::from_btreemap(&configuration);
 
-        eprintln!("[crew] load() config={:?}", configuration);
+        let my_id = get_plugin_ids().plugin_id;
+        eprintln!("[crew:{}] load() config={:?}", my_id, configuration);
 
         // Don't call set_selectable(false) here - we need to remain selectable
         // so the user can focus this pane and grant permission on first run
         request_permission(&[
             PermissionType::ReadApplicationState,
             PermissionType::ChangeApplicationState,
+            PermissionType::MessageAndLaunchOtherPlugins,
         ]);
         subscribe(&[
             EventType::TabUpdate,
             EventType::ModeUpdate,
             EventType::Mouse,
             EventType::PermissionRequestResult,
+            EventType::CustomMessage,
         ]);
     }
 
@@ -380,6 +409,24 @@ impl ZellijPlugin for State {
                     _ => {}
                 }
             }
+            Event::CustomMessage(message, payload) => {
+                eprintln!("[crew] CustomMessage received: is_leader={} message='{}' payload_len={}",
+                    self.is_leader, message, payload.len());
+
+                if !self.is_leader && message == "crew-state" {
+                    // Renderer: receive state from leader
+                    match serde_json::from_str::<Vec<CrewTabState>>(&payload) {
+                        Ok(tabs) => {
+                            eprintln!("[crew:renderer] Received state: {} tabs", tabs.len());
+                            self.received_tabs = tabs;
+                            should_render = true;
+                        }
+                        Err(e) => {
+                            eprintln!("[crew:renderer] ERROR: Failed to parse state: {}", e);
+                        }
+                    }
+                }
+            }
             _ => {
                 eprintln!("Got unrecognized event: {:?}", event);
             }
@@ -388,6 +435,28 @@ impl ZellijPlugin for State {
             should_render = false;
         }
         should_render
+    }
+
+    fn pipe(&mut self, pipe_message: PipeMessage) -> bool {
+        eprintln!("[crew] pipe() received: is_leader={} name='{}' source={:?}",
+            self.is_leader, pipe_message.name, pipe_message.source);
+
+        // Only renderers process crew-state messages
+        if !self.is_leader && pipe_message.name == "crew-state" {
+            if let Some(payload) = pipe_message.payload {
+                match serde_json::from_str::<Vec<CrewTabState>>(&payload) {
+                    Ok(tabs) => {
+                        eprintln!("[crew:renderer] Received state via pipe: {} tabs", tabs.len());
+                        self.received_tabs = tabs;
+                        return true; // Request render
+                    }
+                    Err(e) => {
+                        eprintln!("[crew:renderer] ERROR: Failed to parse state: {}", e);
+                    }
+                }
+            }
+        }
+        false
     }
 
     fn render(&mut self, rows: usize, cols: usize) {
@@ -409,10 +478,33 @@ impl ZellijPlugin for State {
             return;
         }
 
-        // Renderer: show tab names as-is from TabUpdate (for now, no activity indicators yet)
+        // Renderer: get names from received_tabs (leader state) or fall back to TabUpdate
         let names: Vec<String> = self.tabs
             .iter()
-            .map(|tab| format!("{} [○]", tab.name))
+            .map(|tab| {
+                // Try to find crew state for this tab
+                let crew_state = if let Some(tab_id) = parse_default_name(&tab.name) {
+                    // Tab still has default name, look up by tab_id
+                    self.received_tabs.iter().find(|ct| ct.tab_id == tab_id)
+                } else {
+                    // Tab has been renamed, look up by name
+                    self.received_tabs.iter().find(|ct| ct.name == tab.name)
+                };
+
+                if let Some(crew_tab) = crew_state {
+                    // Use leader's name with status indicator
+                    let indicator = match crew_tab.status {
+                        ActivityStatus::Idle => "○",
+                        ActivityStatus::Working => "●",
+                        ActivityStatus::Question => "?",
+                        ActivityStatus::Unknown => "◌",
+                    };
+                    format!("{} [{}]", crew_tab.name, indicator)
+                } else {
+                    // No crew state yet, show TabUpdate name
+                    format!("{} [◌]", tab.name)
+                }
+            })
             .collect();
 
         let mut all_tabs: Vec<LinePart> = vec![];

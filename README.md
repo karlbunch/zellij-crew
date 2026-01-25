@@ -23,6 +23,13 @@ Crew uses a **leader/renderer architecture**:
 
 This architecture allows multiple tab-bar instances while maintaining a single source of truth for tab names.
 
+**How it works:**
+- Leader detects mode by checking render dimensions (rows > 1 = leader, rows ≤ 1 = renderer)
+- Leader manages tab renames, tracks state in CrewTabState (keyed by stable tab_id)
+- Leader broadcasts state to all renderers via pipe messages (`crew-state`)
+- Renderers receive state, display tab names with activity indicators
+- All instances share same WASM binary, no code duplication
+
 ## Usage
 
 **1. Configure in config.kdl:**
@@ -88,8 +95,7 @@ The plugin loads in the background - no pane needed. Restart zellij for config c
 |--------|--------|---------|-------------|
 | `names` | space-separated | NATO phonetic | Pool of names to assign |
 | `mode` | `round-robin`, `fill-in` | `round-robin` | Allocation strategy |
-| `show_position` | `true`, `false` | `false` | Show position: "alpha <1>" |
-| `rename_custom` | `true`, `false` | `false` | Rename user-named tabs |
+| `show_position` | `true`, `false` | `false` | Show position: "alpha <1>" (not yet implemented) |
 
 ### Allocation Modes
 

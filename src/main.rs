@@ -135,6 +135,8 @@ struct State {
 
     // Leader-only state
     known_tabs: HashMap<u32, CrewTabState>,  // tab_id -> CrewTabState
+    pane_manifest: Option<PaneManifest>,     // For mapping pane_id -> tab
+    leader_tabs: Vec<TabInfo>,               // Current tabs (for pane_id -> tab_id mapping)
     last_assigned_idx: Option<usize>,
 
     // Renderer-only state
@@ -224,6 +226,9 @@ impl State {
     fn handle_leader_tab_update(&mut self, tabs: &[TabInfo]) {
         eprintln!("[crew:leader] Processing {} tabs", tabs.len());
 
+        // Store tabs for pane_id -> tab_id mapping
+        self.leader_tabs = tabs.to_vec();
+
         // Track which tab IDs still exist
         let mut current_tab_ids = HashSet::new();
 
@@ -309,6 +314,105 @@ impl State {
         // Broadcast updated state to renderers
         self.broadcast_state();
     }
+
+    fn handle_external_status_update(&mut self, pipe_message: &PipeMessage) -> bool {
+        // Try to parse as JSON first (for name-based routing)
+        if let Some(payload) = &pipe_message.payload {
+            if let Ok(json) = serde_json::from_str::<serde_json::Value>(payload) {
+                if let Some(to_name) = json.get("to").and_then(|v| v.as_str()) {
+                    // Name-based message routing
+                    eprintln!("[crew:leader] Received message for '{}'", to_name);
+                    // TODO: Store messages for named tabs
+                    return true;
+                }
+            }
+        }
+
+        // Parse key=value args format: "pane=ID,state=STATUS"
+        if let Some(state_str) = pipe_message.args.get("state") {
+            if let Some(pane_id_str) = pipe_message.args.get("pane") {
+                if let Ok(pane_id) = pane_id_str.parse::<u32>() {
+                    return self.update_pane_status(pane_id, state_str);
+                }
+            }
+        }
+
+        eprintln!("[crew:leader] Unrecognized status pipe format");
+        false
+    }
+
+    fn update_pane_status(&mut self, pane_id: u32, state_str: &str) -> bool {
+        // Parse activity status
+        let new_status = match state_str {
+            "idle" => ActivityStatus::Idle,
+            "working" => ActivityStatus::Working,
+            "question" => ActivityStatus::Question,
+            _ => {
+                eprintln!("[crew:leader] Unknown status: {}", state_str);
+                return false;
+            }
+        };
+
+        // Find which tab contains this pane
+        let tab_position = if let Some(manifest) = &self.pane_manifest {
+            let result = manifest.panes.iter().find_map(|(tab_pos, panes)| {
+                if panes.iter().any(|p| !p.is_plugin && p.id == pane_id) {
+                    eprintln!("[crew:leader] Found pane {} in tab position {}", pane_id, tab_pos);
+                    Some(*tab_pos)
+                } else {
+                    None
+                }
+            });
+
+            if result.is_none() {
+                eprintln!("[crew:leader] Pane {} not found in manifest (tabs: {})",
+                    pane_id, manifest.panes.len());
+            }
+
+            result
+        } else {
+            eprintln!("[crew:leader] No pane manifest available");
+            None
+        };
+
+        if let Some(tab_pos) = tab_position {
+            eprintln!("[crew:leader] Looking for tab at position {} in {} tabs",
+                tab_pos, self.leader_tabs.len());
+
+            // Map tab position to tab_id from current tabs
+            let tab_at_pos = self.leader_tabs.iter().find(|t| t.position == tab_pos);
+
+            if let Some(tab) = tab_at_pos {
+                eprintln!("[crew:leader] Tab at position {}: name='{}' active={}",
+                    tab_pos, tab.name, tab.active);
+            }
+
+            if let Some(tab_id) = tab_at_pos.and_then(|t| parse_default_name(&t.name).or_else(|| {
+                    // Tab already renamed, find it in known_tabs by name
+                    self.known_tabs.iter()
+                        .find(|(_, ct)| ct.name == t.name)
+                        .map(|(id, _)| *id)
+                }))
+            {
+                // Update specific tab
+                if let Some(crew_tab) = self.known_tabs.get_mut(&tab_id) {
+                    if crew_tab.status != new_status {
+                        eprintln!("[crew:leader] Updating tab '{}' (id={}) to status: {:?}",
+                            crew_tab.name, tab_id, new_status);
+                        crew_tab.status = new_status;
+                        self.broadcast_state();
+                        return true;
+                    }
+                }
+            } else {
+                eprintln!("[crew:leader] Could not map tab_position {} to tab_id", tab_pos);
+            }
+        } else {
+            eprintln!("[crew:leader] Pane {} not found in any tab", pane_id);
+        }
+
+        false
+    }
 }
 
 // Legacy methods removed - see allocate_from_pool() in Leader State Management section
@@ -335,6 +439,7 @@ impl ZellijPlugin for State {
         ]);
         subscribe(&[
             EventType::TabUpdate,
+            EventType::PaneUpdate,
             EventType::ModeUpdate,
             EventType::Mouse,
             EventType::PermissionRequestResult,
@@ -372,6 +477,14 @@ impl ZellijPlugin for State {
                         eprintln!("[crew:renderer] Could not find active tab.");
                     }
                 }
+            }
+            Event::PaneUpdate(pane_manifest) => {
+                if self.is_leader {
+                    // Leader: store pane manifest for pane_id -> tab mapping
+                    self.pane_manifest = Some(pane_manifest);
+                }
+                // Renderers don't need pane info
+                should_render = false;
             }
             Event::PermissionRequestResult(PermissionStatus::Granted) => {
                 if !self.is_leader {
@@ -422,7 +535,7 @@ impl ZellijPlugin for State {
         eprintln!("[crew] pipe() received: is_leader={} name='{}' source={:?}",
             self.is_leader, pipe_message.name, pipe_message.source);
 
-        // Only renderers process crew-state messages
+        // Renderers: receive internal crew-state broadcasts
         if !self.is_leader && pipe_message.name == "crew-state" {
             if let Some(payload) = pipe_message.payload {
                 match serde_json::from_str::<Vec<CrewTabState>>(&payload) {
@@ -436,7 +549,14 @@ impl ZellijPlugin for State {
                     }
                 }
             }
+            return false;
         }
+
+        // Leader: handle external zellij-crew:status messages
+        if self.is_leader && pipe_message.name == "zellij-crew:status" {
+            return self.handle_external_status_update(&pipe_message);
+        }
+
         false
     }
 

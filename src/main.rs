@@ -352,6 +352,7 @@ impl State {
     fn update_name_status(&mut self, name: &str, state_str: &str) -> bool {
         // Parse activity status
         let new_status = match state_str {
+            "unknown" => ActivityStatus::Unknown,
             "idle" => ActivityStatus::Idle,
             "working" => ActivityStatus::Working,
             "question" => ActivityStatus::Question,
@@ -359,7 +360,7 @@ impl State {
             "watching" => ActivityStatus::Watching,
             "attention" => ActivityStatus::Attention,
             _ => {
-                eprintln!("[crew:leader] Unknown status: {}", state_str);
+                eprintln!("[crew:leader] Unrecognized status: {}", state_str);
                 return false;
             }
         };
@@ -381,6 +382,7 @@ impl State {
     fn update_pane_status(&mut self, pane_id: u32, state_str: &str) -> bool {
         // Parse activity status
         let new_status = match state_str {
+            "unknown" => ActivityStatus::Unknown,
             "idle" => ActivityStatus::Idle,
             "working" => ActivityStatus::Working,
             "question" => ActivityStatus::Question,
@@ -388,7 +390,7 @@ impl State {
             "watching" => ActivityStatus::Watching,
             "attention" => ActivityStatus::Attention,
             _ => {
-                eprintln!("[crew:leader] Unknown status: {}", state_str);
+                eprintln!("[crew:leader] Unrecognized status: {}", state_str);
                 return false;
             }
         };
@@ -608,6 +610,7 @@ Usage:
   zellij pipe --name zellij-crew:status --args "name=NAME,state=STATE"
 
 States:
+  unknown   🫥  No status / agent exited
   idle      🥱  Agent idle
   working   🤖  Agent working
   question  🙋  Agent has a question

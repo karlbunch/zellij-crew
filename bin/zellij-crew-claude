@@ -1,0 +1,30 @@
+#!/bin/sh
+# zellij-crew-claude - Claude Code hook for zellij-crew status updates
+#
+# Usage in .claude/settings.json:
+#   "hooks": {
+#     "PreToolUse": ["zellij-crew-claude working"],
+#     "Stop": ["zellij-crew-claude idle"],
+#     "Notification": ["zellij-crew-claude attention"]
+#   }
+#
+# Manual usage:
+#   zellij-crew-claude working|idle|question|sleeping|watching|attention
+
+# Exit silently if not running under Zellij
+[ -z "$ZELLIJ" ] && exit 0
+[ -z "$ZELLIJ_PANE_ID" ] && exit 0
+
+state="${1:-working}"
+
+# Validate state
+case "$state" in
+    unknown|idle|working|question|sleeping|watching|attention) ;;
+    *)
+        echo "zellij-crew-claude: invalid state '$state'" >&2
+        echo "Valid states: unknown idle working question sleeping watching attention" >&2
+        exit 1
+        ;;
+esac
+
+exec zellij pipe --name zellij-crew:status --args "pane=$ZELLIJ_PANE_ID,state=$state"

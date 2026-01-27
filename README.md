@@ -10,7 +10,7 @@ Build the plugin:
 cargo build --release
 ```
 
-The WASM binary will be at `target/wasm32-wasip1/release/zellij_crew.wasm`.
+The WASM binary will be at `target/wasm32-wasip1/release/zellij-crew.wasm`.
 
 Copy it to your zellij plugins directory or reference it directly in your configuration.
 
@@ -74,7 +74,7 @@ Add to your zellij config (`~/.config/zellij/config.kdl`):
 
 ```kdl
 plugins {
-    crew location="file:/path/to/zellij_crew.wasm" {
+    crew location="file:/path/to/zellij-crew.wasm" {
         names "alice bob carol dave eve frank grace henry iris jack"
         mode "fill-in"
         show_position "false"

@@ -107,6 +107,9 @@ enum ActivityStatus {
     Idle,
     Working,
     Question,
+    Sleeping,
+    Watching,
+    Attention,
 }
 
 impl Default for ActivityStatus {
@@ -328,16 +331,50 @@ impl State {
             }
         }
 
-        // Parse key=value args format: "pane=ID,state=STATUS"
+        // Parse key=value args format: "pane=ID,state=STATUS" or "name=NAME,state=STATUS"
         if let Some(state_str) = pipe_message.args.get("state") {
+            // Try pane ID first
             if let Some(pane_id_str) = pipe_message.args.get("pane") {
                 if let Ok(pane_id) = pane_id_str.parse::<u32>() {
                     return self.update_pane_status(pane_id, state_str);
                 }
             }
+            // Try name
+            if let Some(name) = pipe_message.args.get("name") {
+                return self.update_name_status(name, state_str);
+            }
         }
 
         eprintln!("[crew:leader] Unrecognized status pipe format");
+        false
+    }
+
+    fn update_name_status(&mut self, name: &str, state_str: &str) -> bool {
+        // Parse activity status
+        let new_status = match state_str {
+            "idle" => ActivityStatus::Idle,
+            "working" => ActivityStatus::Working,
+            "question" => ActivityStatus::Question,
+            "sleeping" => ActivityStatus::Sleeping,
+            "watching" => ActivityStatus::Watching,
+            "attention" => ActivityStatus::Attention,
+            _ => {
+                eprintln!("[crew:leader] Unknown status: {}", state_str);
+                return false;
+            }
+        };
+
+        // Find tab by name
+        if let Some(crew_tab) = self.known_tabs.values_mut().find(|t| t.name == name) {
+            if crew_tab.status != new_status {
+                eprintln!("[crew:leader] Updating tab '{}' to status: {:?}", name, new_status);
+                crew_tab.status = new_status;
+                self.broadcast_state();
+                return true;
+            }
+        } else {
+            eprintln!("[crew:leader] Tab '{}' not found", name);
+        }
         false
     }
 
@@ -347,6 +384,9 @@ impl State {
             "idle" => ActivityStatus::Idle,
             "working" => ActivityStatus::Working,
             "question" => ActivityStatus::Question,
+            "sleeping" => ActivityStatus::Sleeping,
+            "watching" => ActivityStatus::Watching,
+            "attention" => ActivityStatus::Attention,
             _ => {
                 eprintln!("[crew:leader] Unknown status: {}", state_str);
                 return false;
@@ -436,6 +476,7 @@ impl ZellijPlugin for State {
             PermissionType::ReadApplicationState,
             PermissionType::ChangeApplicationState,
             PermissionType::MessageAndLaunchOtherPlugins,
+            PermissionType::ReadCliPipes,
         ]);
         subscribe(&[
             EventType::TabUpdate,
@@ -554,6 +595,101 @@ impl ZellijPlugin for State {
 
         // Leader: handle external zellij-crew:status messages
         if self.is_leader && pipe_message.name == "zellij-crew:status" {
+            // Help command - check args or payload
+            let is_help = pipe_message.args.contains_key("help")
+                || pipe_message.payload.as_deref() == Some("help");
+
+            if is_help {
+                if let PipeSource::Cli(pipe_id) = &pipe_message.source {
+                    let help = r#"zellij-crew:status - Update tab activity status
+
+Usage:
+  zellij pipe --name zellij-crew:status --args "pane=PANE_ID,state=STATE"
+  zellij pipe --name zellij-crew:status --args "name=NAME,state=STATE"
+
+States:
+  idle      🥱  Agent idle
+  working   🤖  Agent working
+  question  🙋  Agent has a question
+  sleeping  😴  Agent sleeping/paused
+  watching  👀  Agent watching/monitoring
+  attention 🔔  Needs attention
+
+Commands:
+  --args help              Show this help
+  --args list              List all tabs (alias: ls)
+  --args format=json,list  Output in JSON format
+
+Examples:
+  zellij pipe --name zellij-crew:status --args "pane=$ZELLIJ_PANE_ID,state=working"
+  zellij pipe --name zellij-crew:status --args "name=Alice,state=attention"
+"#;
+                    cli_pipe_output(pipe_id, help);
+                }
+                return false;
+            }
+
+            // List command - show all tabs
+            let is_list = pipe_message.args.contains_key("list")
+                || pipe_message.args.contains_key("ls")
+                || pipe_message.payload.as_deref() == Some("list")
+                || pipe_message.payload.as_deref() == Some("ls");
+
+            if is_list {
+                if let PipeSource::Cli(pipe_id) = &pipe_message.source {
+                    let want_json = pipe_message.args.get("format").map(|s| s.as_str()) == Some("json");
+
+                    let mut tabs: Vec<_> = self.known_tabs.values().collect();
+                    tabs.sort_by_key(|t| t.tab_id);
+
+                    let output = if want_json {
+                        // JSON format
+                        let json_tabs: Vec<_> = tabs.iter().map(|tab| {
+                            let status_str = match tab.status {
+                                ActivityStatus::Unknown => "unknown",
+                                ActivityStatus::Idle => "idle",
+                                ActivityStatus::Working => "working",
+                                ActivityStatus::Question => "question",
+                                ActivityStatus::Sleeping => "sleeping",
+                                ActivityStatus::Watching => "watching",
+                                ActivityStatus::Attention => "attention",
+                            };
+                            serde_json::json!({
+                                "id": tab.tab_id,
+                                "name": tab.name,
+                                "status": status_str
+                            })
+                        }).collect();
+                        format!("{}\n", serde_json::to_string_pretty(&json_tabs).unwrap_or_else(|_| "[]".to_string()))
+                    } else {
+                        // Human-readable format
+                        let mut out = String::from("ID\tName\tStatus\n");
+                        out.push_str("--\t----\t------\n");
+
+                        for tab in tabs {
+                            let status_str = match tab.status {
+                                ActivityStatus::Unknown => "🫥 unknown",
+                                ActivityStatus::Idle => "🥱 idle",
+                                ActivityStatus::Working => "🤖 working",
+                                ActivityStatus::Question => "🙋 question",
+                                ActivityStatus::Sleeping => "😴 sleeping",
+                                ActivityStatus::Watching => "👀 watching",
+                                ActivityStatus::Attention => "🔔 attention",
+                            };
+                            out.push_str(&format!("{}\t{}\t{}\n", tab.tab_id, tab.name, status_str));
+                        }
+
+                        if self.known_tabs.is_empty() {
+                            out.push_str("(no tabs)\n");
+                        }
+                        out
+                    };
+
+                    cli_pipe_output(pipe_id, &output);
+                }
+                return false;
+            }
+
             return self.handle_external_status_update(&pipe_message);
         }
 
@@ -595,15 +731,18 @@ impl ZellijPlugin for State {
                 if let Some(crew_tab) = crew_state {
                     // Use leader's name with status indicator
                     let indicator = match crew_tab.status {
-                        ActivityStatus::Idle => "○",
-                        ActivityStatus::Working => "●",
-                        ActivityStatus::Question => "?",
-                        ActivityStatus::Unknown => "◌",
+                        ActivityStatus::Unknown => "🫥",
+                        ActivityStatus::Idle => "🥱",
+                        ActivityStatus::Working => "🤖",
+                        ActivityStatus::Question => "🙋",
+                        ActivityStatus::Sleeping => "😴",
+                        ActivityStatus::Watching => "👀",
+                        ActivityStatus::Attention => "🔔",
                     };
                     format!("{} [{}]", crew_tab.name, indicator)
                 } else {
                     // No crew state yet, show TabUpdate name
-                    format!("{} [◌]", tab.name)
+                    format!("{} [🫥]", tab.name)
                 }
             })
             .collect();

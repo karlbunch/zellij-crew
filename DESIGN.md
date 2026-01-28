@@ -64,33 +64,66 @@ Close "b", new tab created → "b" (fills the gap)
 
 ## State Management
 
+The plugin maintains separate state for leader and renderer instances:
+
 ```rust
 struct State {
-    // Tab tracking
-    tabs: Vec<TabInfo>,           // Current tabs from TabUpdate
-    active_tab_idx: usize,        // Currently focused tab
+    // Common state (both modes)
+    mode_info: ModeInfo,          // Colors, palette, capabilities
+    config: Config,               // Name pool, allocation mode
+    first_render_done: bool,      // For leader detection
+    is_leader: bool,              // true for load_plugins instance, false for tab-bars
 
-    // Name allocation
-    // CRITICAL: Track by tab.name (stable) not position (shifts on tab close)
-    assigned_names: HashMap<String, String>,  // tab.name -> crew_name (e.g., "Tab #1" -> "alpha")
-    last_assigned_idx: usize,     // For round-robin mode: index of last assigned name
+    // Leader-only state
+    known_tabs: HashMap<u32, CrewTabState>,  // tab_id -> CrewTabState (source of truth)
+    pane_manifest: Option<PaneManifest>,     // For mapping pane_id -> tab_id
+    leader_tabs: Vec<TabInfo>,               // Current tabs (for pane_id -> tab_id mapping)
+    last_assigned_idx: Option<usize>,        // For round-robin mode: index of last assigned name
 
-    // Configuration
-    config: Config,
+    // Renderer-only state
+    received_tabs: Vec<CrewTabState>,  // From leader broadcast
+    tabs: Vec<TabInfo>,                // From TabUpdate (for rendering tab bar)
+    active_tab_idx: usize,             // Currently focused tab
+    tab_line: Vec<LinePart>,           // Cached for mouse clicks
+}
+
+struct CrewTabState {
+    tab_id: u32,                     // Stable ID from "Tab #N" (key in HashMap)
+    name: String,                    // Current name ("Alice" after rename, "Tab #5" before)
+    pending_rename: Option<String>,  // Some("Alice") when rename sent, waiting for confirmation
+    user_defined: bool,              // true if user named it, false if from our pool
+    status: ActivityStatus,          // Current activity status
 }
 
 struct Config {
     names: Vec<String>,           // Name pool
     mode: AllocationMode,         // round-robin or fill-in
-    show_position: bool,          // Whether to show position numbers
-    rename_custom: bool,          // Whether to rename custom-named tabs
+    hide_swap_layout_indication: bool,  // Whether to hide swap layout status
+    // show_position feature planned but not implemented
 }
 
 enum AllocationMode {
     RoundRobin,
     FillIn,
 }
+
+enum ActivityStatus {
+    Unknown,    // Just opened, no data yet
+    Idle,       // At shell prompt, waiting for input
+    Working,    // Agent actively processing
+    Question,   // Agent asked a question
+    Sleeping,   // No activity (timeout)
+    Watching,   // Monitoring/observing
+    Attention,  // Needs user attention
+}
 ```
+
+**Key Design Decisions:**
+
+- **tab_id as HashMap key**: Tab IDs are stable (never change, even when tabs close/reorder). Parsed from "Tab #N" default name. Required for `rename_tab(tab_id, name)` API.
+- **pending_rename flag**: Prevents infinite rename loops. When we call `rename_tab()`, the next TabUpdate may still show the old name. We track pending renames to avoid re-renaming the same tab.
+- **is_leader detection**: Leader instance gets rows > 1 on first render (permission dialog size), renderers get rows ≤ 1. This allows single WASM binary to serve both roles.
+- **Broadcast not query**: Leader broadcasts state to all renderers on every change. This is more efficient than renderers querying leader, and mirrors how zellij handles multi-user focus indicators.
 
 ## Event Flow
 
@@ -107,26 +140,47 @@ Only the leader instance handles renaming. Renderers never call rename_tab().
 ```
 TabUpdate event received (LEADER ONLY)
     │
+    ├─► Store tabs for pane_id → tab_id mapping
+    │
     ├─► For each tab in update:
     │       │
-    │       ├─► Tab name in known_tabs?
-    │       │       YES → Update TabState, skip rename
-    │       │       NO  → Continue (new tab)
-    │       │
     │       ├─► Is default name "Tab #N"?
-    │       │       YES → Parse tab_id from name, allocate from pool
-    │       │             rename_tab(tab_id, new_name)
-    │       │             Add to known_tabs with user_defined: false
-    │       │       NO  → User named it, accept as-is
-    │       │             Add to known_tabs with user_defined: true
+    │       │       │
+    │       │       YES → Parse tab_id from name
+    │       │             │
+    │       │             ├─► Already in known_tabs?
+    │       │             │       YES → Check pending_rename
+    │       │             │             │
+    │       │             │             └─► If pending, wait for confirmation
+    │       │             │       NO  → New tab, allocate from pool
+    │       │             │             rename_tab(tab_id, new_name)
+    │       │             │             Add to known_tabs with pending_rename: Some(new_name)
+    │       │       │
+    │       │       NO → Non-default name (renamed or user-defined)
+    │       │             │
+    │       │             └─► Check pending_rename in known_tabs
+    │       │                     │
+    │       │                     └─► If matches: rename confirmed!
+    │       │                         Clear pending_rename, update name
     │       │
-    │       └─► Broadcast updated TabState to renderers
+    │       └─► Mark tab_id as still present
     │
     └─► For tabs no longer present (closed):
             │
-            ├─► If user_defined: false → name returns to pool
-            └─► Remove from known_tabs
+            ├─► Remove from known_tabs
+            └─► If user_defined: false → name returns to pool (fill-in mode)
+
+    Finally: broadcast_state() → all renderers receive updated CrewTabState
 ```
+
+**Rename Confirmation Loop:**
+
+1. Leader calls `rename_tab(5, "Alice")`, stores `pending_rename: Some("Alice")`
+2. Next TabUpdate may still show "Tab #5" (rename not processed yet)
+3. Leader sees tab 5 with pending_rename → skips (no re-rename)
+4. Later TabUpdate shows "Alice" → matches pending_rename
+5. Leader confirms: `name = "Alice"`, `pending_rename = None`
+6. No infinite loop
 
 ### Parsing Default Tab Names
 
@@ -750,31 +804,26 @@ plugins {
 }
 ```
 
-## Implementation Phases
+## Implementation Status
 
-### Phase 2a: Tab-Bar Foundation
-- Fork default tab-bar plugin structure
-- Integrate existing naming logic
-- Basic rendering with names
+**✅ Completed:**
+- Tab-bar foundation (forked from zellij default tab-bar)
+- Leader/renderer architecture (single WASM binary, dual mode)
+- Name allocation (round-robin and fill-in modes)
+- Activity status system (7 states with emoji indicators)
+- Pipe integration (external control via zellij-crew:status)
+- State broadcasting (leader → renderers via crew-state pipe)
+- Pane ID → tab mapping (via PaneManifest)
+- Name-based and pane-based status updates
+- Built-in help and list commands
+- Hook script (bin/zellij-crew-claude)
 
-### Phase 2b: Pipe Integration
-- Subscribe to pipe messages
-- Implement TabState
-- Update indicators from pipe signals
-
-### Phase 2c: Content Analysis
-- Add PaneContents permission
-- Implement debounced analysis
-- Prompt regex matching
-
-### Phase 2d: Timeout Detection
-- Timer-based sleeping detection
-- Activity timestamp tracking
-
-### Phase 2e: Polish
-- Configurable indicators
-- Color theming
-- Performance tuning
+**📋 Planned (see Future Enhancements below):**
+- Content analysis (automatic state detection from terminal output)
+- Timeout detection (sleeping state when no activity)
+- show_position feature (display "alpha <1>" style names)
+- Inter-agent messaging (tab-to-tab communication)
+- Configurable indicators (custom emoji/text per state)
 
 ## Default Tab-Bar Plugin Analysis
 
@@ -895,18 +944,69 @@ if let Some(indicator) = get_activity_indicator(tab_id, &tab_state) {
 }
 ```
 
-## Future: Inter-Agent Messaging
+---
 
-With the pipe infrastructure in place, agents can send messages to each other:
+# Future Enhancements
 
+This section documents planned features that are not yet implemented.
+
+## show_position Feature
+
+Display tab position in names: "alpha <1>", "bravo <2>", etc.
+
+**Status:** Config field removed (was dead code). Needs implementation.
+
+**Design:** Append position to name in renderer, not in CrewTabState (keeps leader state clean).
+
+## Content Analysis (Automatic State Detection)
+
+Analyze terminal output to infer activity state when no explicit signals available.
+
+**Challenges:**
+- Performance (terminal output can be large)
+- False positives (matching "$ " in program output, not prompts)
+- Privacy (reading terminal content)
+
+**Approach:**
+- Debounced analysis (200ms after output stops)
+- Last N characters only (default: 500)
+- Regex patterns for prompt detection
+- Skip when recent pipe signal exists
+
+## Timeout Detection (Sleeping State)
+
+Mark tabs as "sleeping" (😴) when no activity for N seconds.
+
+**Design:** Timer-based, tracks last activity timestamp per tab. Honest about uncertainty - we're not claiming idle, just that nothing's happening.
+
+## Inter-Agent Messaging
+
+Enable tab-to-tab communication using named tabs as addresses.
+
+**Protocol:**
 ```bash
-# Agent in "alice" tab asking "bob" a question
 zellij pipe --name zellij-crew:message --args "from=alice,to=bob,msg=What's the API schema?"
 ```
 
-The plugin could:
-1. Route messages between named tabs
-2. Show message indicators
-3. Provide a message queue that agents can poll
+**Implementation:**
+1. Leader receives message, stores in per-tab queue
+2. Target tab polls for messages (via pipe query)
+3. Leader shows message indicator (📬) on tab bar
 
-This builds on the foundation of named tabs + activity state to enable true multi-agent coordination.
+**Use case:** AI agents in different tabs can coordinate work, share context, ask each other questions.
+
+## Configurable Indicators
+
+Allow users to customize emoji/text for each activity state.
+
+**Config example:**
+```kdl
+crew {
+    names "alice bob carol"
+    indicator_working "⚡"
+    indicator_idle "💤"
+    indicator_question "❓"
+}
+```
+
+**Status:** Currently hardcoded in main.rs:736-744.

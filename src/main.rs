@@ -57,7 +57,8 @@ impl Default for AllocationMode {
 struct Config {
     names: Vec<String>,
     mode: AllocationMode,
-    show_position: bool,
+    // TODO: Implement show_position feature (see DESIGN.md Future Enhancements)
+    // show_position: bool,  // Would show "alpha <1>" style names
     hide_swap_layout_indication: bool,
 }
 
@@ -78,11 +79,6 @@ impl Config {
             _ => AllocationMode::RoundRobin,
         };
 
-        let show_position = config
-            .get("show_position")
-            .map(|s| s == "true")
-            .unwrap_or(false);
-
         let hide_swap_layout_indication = config
             .get("hide_swap_layout_indication")
             .map(|s| s == "true")
@@ -91,7 +87,6 @@ impl Config {
         Config {
             names,
             mode,
-            show_position,
             hide_swap_layout_indication,
         }
     }
@@ -122,8 +117,15 @@ impl Default for ActivityStatus {
 struct CrewTabState {
     tab_id: u32,                     // Stable ID from "Tab #N" (redundant with HashMap key but explicit)
     name: String,                    // Current name ("Alice" after rename, "Tab #5" before)
+
+    // ADR: Why pending_rename flag?
+    // Prevents infinite rename loops: when we call rename_tab(), the next TabUpdate
+    // may still show the old name (rename not processed yet). We track pending renames
+    // to avoid re-renaming the same tab. Once TabUpdate shows the new name, we confirm
+    // by matching against pending_rename and clearing the flag.
     #[serde(skip)]                   // Don't serialize internal rename tracking
     pending_rename: Option<String>,  // Some("Alice") when rename sent, waiting for confirmation
+
     user_defined: bool,              // true if user named it, false if from our pool
     status: ActivityStatus,          // Current activity status
 }
@@ -137,6 +139,11 @@ struct State {
     is_leader: bool,
 
     // Leader-only state
+    // ADR: Why HashMap<u32, CrewTabState> with tab_id as key?
+    // - tab_id is stable (never changes, even when tabs close/reorder)
+    // - Parsed from "Tab #N" default name (N is the tab_id)
+    // - Required for rename_tab(tab_id, name) API
+    // - O(1) lookup when confirming renames or updating status
     known_tabs: HashMap<u32, CrewTabState>,  // tab_id -> CrewTabState
     pane_manifest: Option<PaneManifest>,     // For mapping pane_id -> tab
     leader_tabs: Vec<TabInfo>,               // Current tabs (for pane_id -> tab_id mapping)
@@ -167,6 +174,14 @@ fn parse_default_name(name: &str) -> Option<u32> {
 // ============================================================================
 
 impl State {
+    // ADR: Why broadcast instead of query?
+    // We could have renderers query the leader for state, but broadcasting is more efficient:
+    // - Query: N renderers × M queries/sec = N×M messages (grows with renderer count)
+    // - Broadcast: 1 broadcast on state change (typically 0-5/sec, independent of renderer count)
+    // - Mirrors how zellij handles multi-user focus indicators (broadcast TabInfo.other_focused_clients)
+    // - Simpler: renderers are stateless, just paint what they receive
+    // - No race conditions: all renderers see same state at same time
+    // Trade-off: Small delay when new renderer starts (waits for next state change)
     fn broadcast_state(&self) {
         if !self.is_leader {
             return; // Only leader broadcasts
@@ -457,7 +472,8 @@ impl State {
     }
 }
 
-// Legacy methods removed - see allocate_from_pool() in Leader State Management section
+// Name allocation logic is in allocate_from_pool() (lines 191-227)
+// Old per-tab iteration approach was removed during leader/renderer refactor
 
 // ============================================================================
 // Plugin Implementation
@@ -700,8 +716,15 @@ Examples:
     }
 
     fn render(&mut self, rows: usize, cols: usize) {
-        // Detect leader on first render: load_plugins instance gets permission dialog (rows > 1)
-        // Tab-bar instances get rows=1 (or rows=0 briefly)
+        // ADR: Why rows > 1 for leader detection?
+        // Through testing, we discovered that load_plugins instances receive a larger virtual
+        // pane on first render (rows=20 even after permissions cached), while layout-based
+        // tab-bar instances get rows ≤ 1. This allows a single WASM binary to serve both
+        // roles without config changes. Alternative approaches considered:
+        // - Separate binaries: Code duplication, harder to maintain
+        // - Config flag: User must configure twice (error-prone)
+        // - Plugin ID detection: IDs are not deterministic across restarts
+        // The rows heuristic is robust and requires no user configuration.
         if !self.first_render_done {
             self.first_render_done = true;
             self.is_leader = rows > 1;
@@ -807,10 +830,14 @@ Examples:
 }
 
 // ============================================================================
-// Tests (TODO: rewrite for leader/renderer architecture)
+// Tests
 // ============================================================================
 
-// #[cfg(test)]
-// mod tests {
-//     Tests temporarily disabled during leader/renderer refactor
-// }
+// Tests disabled during leader/renderer architecture migration
+// TODO: Rewrite tests for new architecture (see TESTING.md)
+//
+// Test areas needed:
+// - Name allocation (round-robin, fill-in)
+// - Leader/renderer state broadcast
+// - Pipe protocol handling (status updates, list command)
+// - Tab rename confirmation loop

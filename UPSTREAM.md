@@ -12,27 +12,22 @@ This plugin is based on the official zellij tab-bar plugin.
 
 ## Architecture
 
-All customizations are isolated in `crew.rs`. Upstream files have minimal hooks.
+This plugin is a full rewrite of the tab-bar with crew functionality fully integrated.
 
 | File | Status | Notes |
 |------|--------|-------|
-| `line.rs` | Verbatim copy | No modifications |
-| `tab.rs` | Verbatim copy | No modifications |
-| `main.rs` | Minimal hooks | ~5 hook points (see below) |
-| `crew.rs` | Custom | All zellij-crew logic |
+| `line.rs` | Verbatim copy | No modifications from upstream |
+| `tab.rs` | Verbatim copy | No modifications from upstream |
+| `main.rs` | Complete rewrite | 817 lines - all crew logic integrated |
 
-## Hooks in main.rs
+**Important:** Unlike typical forks, main.rs is NOT a lightly-modified upstream file. It's a complete reimplementation that combines:
+- Tab-bar rendering (from upstream)
+- Leader/renderer architecture
+- Name allocation and tracking
+- Activity status system
+- Pipe message handling
 
-```rust
-mod crew;                           // 1. Import crew module
-crew: crew::CrewState,              // 2. State field
-crew::on_load(&mut self.crew, &config);        // 3. In load()
-crew::on_update(&mut self.crew, &event);       // 4. In update()
-crew::on_tab_update(&mut self.crew, &tabs);    // 5. In TabUpdate handler
-crew::get_tab_name(&mut self.crew, t);         // 6. In render() loop
-```
-
-Also: `pub` visibility on LinePart fields, `PermissionRequestResult` event subscription.
+**There is no separate crew.rs module.** All logic lives in main.rs.
 
 ## Syncing with upstream
 
@@ -49,7 +44,4 @@ cp /path/to/zellij/default-plugins/tab-bar/src/line.rs src/
 cp /path/to/zellij/default-plugins/tab-bar/src/tab.rs src/
 ```
 
-For main.rs, diff and manually apply the hook pattern:
-```bash
-diff -u /path/to/zellij/default-plugins/tab-bar/src/main.rs src/main.rs
-```
+**WARNING:** Do NOT sync main.rs. It's a complete rewrite and cannot be mechanically merged with upstream. If upstream changes tab-bar's API or event handling, manual porting is required.

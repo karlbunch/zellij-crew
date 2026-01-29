@@ -116,6 +116,7 @@ impl Default for ActivityStatus {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct CrewTabState {
     tab_id: u32,                     // Stable ID from "Tab #N" (redundant with HashMap key but explicit)
+    position: usize,                 // Current position (updates when tabs reorder)
     name: String,                    // Current name ("Alice" after rename, "Tab #5" before)
 
     // ADR: Why pending_rename flag?
@@ -247,75 +248,117 @@ impl State {
         // Store tabs for pane_id -> tab_id mapping
         self.leader_tabs = tabs.to_vec();
 
-        // Track which tab IDs still exist
-        let mut current_tab_ids = HashSet::new();
+        // Track which tab IDs we've seen in this update
+        let mut seen_tab_ids = HashSet::new();
 
-        // Process each tab
+        // PASS 1: Match existing tabs by name (handles renames) and position (handles moves)
         for tab in tabs {
-            if let Some(tab_id) = parse_default_name(&tab.name) {
-                // Default name "Tab #N"
-                current_tab_ids.insert(tab_id);
+            let mut matched = false;
 
-                if let Some(crew_tab) = self.known_tabs.get_mut(&tab_id) {
-                    // Known tab, check if still waiting for rename
-                    if crew_tab.pending_rename.is_some() {
-                        eprintln!("[crew:leader] Tab #{} still pending rename", tab_id);
-                    }
-                } else {
-                    // New tab, needs renaming
-                    if let Some(new_name) = self.allocate_from_pool() {
-                        eprintln!("[crew:leader] Renaming Tab #{} -> {}", tab_id, new_name);
-                        rename_tab(tab_id, new_name.clone());
-
-                        self.known_tabs.insert(
-                            tab_id,
-                            CrewTabState {
-                                tab_id,
-                                name: tab.name.clone(),  // Still "Tab #N" until confirmed
-                                pending_rename: Some(new_name),
-                                user_defined: false,
-                                status: ActivityStatus::Unknown,
-                            },
-                        );
-                    } else {
-                        eprintln!("[crew:leader] Pool exhausted, leaving Tab #{} unnamed", tab_id);
-                    }
-                }
-            } else {
-                // Non-default name (already renamed or user-defined)
-                // Try to find which tab this is by checking pending_rename
-                let mut found_tab_id = None;
-                for (id, crew_tab) in self.known_tabs.iter_mut() {
-                    if let Some(pending) = &crew_tab.pending_rename {
-                        if pending == &tab.name {
-                            // Rename confirmed!
-                            eprintln!("[crew:leader] Rename confirmed: Tab #{} -> {}", id, tab.name);
-                            crew_tab.name = tab.name.clone();
-                            crew_tab.pending_rename = None;
-                            found_tab_id = Some(*id);
-                            break;
-                        }
-                    } else if crew_tab.name == tab.name {
-                        // Already confirmed
-                        found_tab_id = Some(*id);
+            // Try to match by name first
+            for (tab_id, crew_tab) in self.known_tabs.iter_mut() {
+                if let Some(pending) = &crew_tab.pending_rename {
+                    if pending == &tab.name {
+                        // Pending rename confirmed
+                        eprintln!("[crew:leader] Rename confirmed: Tab #{} -> {} (pos {})", tab_id, tab.name, tab.position);
+                        crew_tab.name = tab.name.clone();
+                        crew_tab.position = tab.position;
+                        crew_tab.pending_rename = None;
+                        seen_tab_ids.insert(*tab_id);
+                        matched = true;
                         break;
                     }
+                } else if crew_tab.name == tab.name {
+                    // Name match - update position if changed
+                    if crew_tab.position != tab.position {
+                        eprintln!("[crew:leader] Tab #{} '{}' moved from position {} to {}",
+                            tab_id, tab.name, crew_tab.position, tab.position);
+                        crew_tab.position = tab.position;
+                    }
+                    seen_tab_ids.insert(*tab_id);
+                    matched = true;
+                    break;
                 }
+            }
 
-                if let Some(tab_id) = found_tab_id {
-                    current_tab_ids.insert(tab_id);
-                } else {
-                    // User-defined name - we don't know the tab_id, skip tracking
-                    eprintln!("[crew:leader] Ignoring user-defined name '{}' (can't extract tab_id)", tab.name);
+            if matched {
+                continue;
+            }
+
+            // Try to match by position (catches user renames of existing tabs)
+            for (tab_id, crew_tab) in self.known_tabs.iter_mut() {
+                if crew_tab.position == tab.position && crew_tab.pending_rename.is_none() {
+                    // Same position, different name - user renamed it
+                    eprintln!("[crew:leader] Tab #{} at position {} renamed: '{}' -> '{}' (user-defined)",
+                        tab_id, tab.position, crew_tab.name, tab.name);
+                    crew_tab.name = tab.name.clone();
+                    crew_tab.user_defined = true;
+                    seen_tab_ids.insert(*tab_id);
+                    matched = true;
+                    break;
                 }
+            }
+
+            if matched {
+                continue;
+            }
+
+            // No match by name or position - this is a new tab
+            // Try to extract tab_id from default name, or infer it
+            let tab_id = if let Some(id) = parse_default_name(&tab.name) {
+                id
+            } else {
+                // User-defined name on new tab - infer tab_id from missing IDs
+                // Find the lowest tab_id not in known_tabs
+                let used_ids: HashSet<u32> = self.known_tabs.keys().cloned().collect();
+                (1..=100).find(|id| !used_ids.contains(id)).unwrap_or(tab.position as u32)
+            };
+
+            if parse_default_name(&tab.name).is_some() && !self.known_tabs.contains_key(&tab_id) {
+                // New tab with default name - allocate a name from pool
+                if let Some(new_name) = self.allocate_from_pool() {
+                    eprintln!("[crew:leader] New tab: renaming Tab #{} -> {} (pos {})", tab_id, new_name, tab.position);
+                    rename_tab(tab_id, new_name.clone());
+
+                    self.known_tabs.insert(
+                        tab_id,
+                        CrewTabState {
+                            tab_id,
+                            position: tab.position,
+                            name: tab.name.clone(),
+                            pending_rename: Some(new_name),
+                            user_defined: false,
+                            status: ActivityStatus::Unknown,
+                        },
+                    );
+                    seen_tab_ids.insert(tab_id);
+                } else {
+                    eprintln!("[crew:leader] Pool exhausted, leaving Tab #{} unnamed", tab_id);
+                }
+            } else if !seen_tab_ids.contains(&tab_id) {
+                // New tab with user-defined name - track it
+                eprintln!("[crew:leader] New tab with user-defined name: Tab #{} '{}' (pos {})",
+                    tab_id, tab.name, tab.position);
+                self.known_tabs.insert(
+                    tab_id,
+                    CrewTabState {
+                        tab_id,
+                        position: tab.position,
+                        name: tab.name.clone(),
+                        pending_rename: None,
+                        user_defined: true,
+                        status: ActivityStatus::Unknown,
+                    },
+                );
+                seen_tab_ids.insert(tab_id);
             }
         }
 
-        // Remove closed tabs
+        // PASS 2: Remove closed tabs
         let closed: Vec<u32> = self
             .known_tabs
             .keys()
-            .filter(|tab_id| !current_tab_ids.contains(tab_id))
+            .filter(|tab_id| !seen_tab_ids.contains(tab_id))
             .cloned()
             .collect();
 
@@ -324,7 +367,7 @@ impl State {
                 if !crew_tab.user_defined {
                     eprintln!("[crew:leader] Tab #{} '{}' closed, name returns to pool", tab_id, crew_tab.name);
                 } else {
-                    eprintln!("[crew:leader] Tab #{} '{}' closed (user-defined, discarded)", tab_id, crew_tab.name);
+                    eprintln!("[crew:leader] Tab #{} '{}' closed (user-defined)", tab_id, crew_tab.name);
                 }
             }
         }

@@ -60,6 +60,9 @@ struct Config {
     // TODO: Implement show_position feature (see DESIGN.md Future Enhancements)
     // show_position: bool,  // Would show "alpha <1>" style names
     hide_swap_layout_indication: bool,
+    /// Per-status indicator overrides. Key present with empty string = suppress brackets entirely.
+    /// Key absent = use default emoji.
+    status_indicators: HashMap<ActivityStatus, String>,
 }
 
 impl Config {
@@ -84,10 +87,36 @@ impl Config {
             .map(|s| s == "true")
             .unwrap_or(false);
 
+        let mut status_indicators = HashMap::new();
+        let status_keys: &[(&str, ActivityStatus)] = &[
+            ("status_unknown", ActivityStatus::Unknown),
+            ("status_idle", ActivityStatus::Idle),
+            ("status_working", ActivityStatus::Working),
+            ("status_question", ActivityStatus::Question),
+            ("status_sleeping", ActivityStatus::Sleeping),
+            ("status_watching", ActivityStatus::Watching),
+            ("status_attention", ActivityStatus::Attention),
+        ];
+        for (key, variant) in status_keys {
+            if let Some(val) = config.get(*key) {
+                status_indicators.insert(variant.clone(), val.clone());
+            }
+        }
+
         Config {
             names,
             mode,
             hide_swap_layout_indication,
+            status_indicators,
+        }
+    }
+
+    /// Returns the display string for a status, or None to suppress the indicator entirely.
+    fn indicator_for(&self, status: &ActivityStatus) -> Option<&str> {
+        match self.status_indicators.get(status) {
+            Some(s) if s.is_empty() => None,
+            Some(s) => Some(s.as_str()),
+            None => Some(status.default_indicator()),
         }
     }
 }
@@ -96,7 +125,7 @@ impl Config {
 // Plugin State
 // ============================================================================
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 enum ActivityStatus {
     Unknown,
     Idle,
@@ -105,6 +134,20 @@ enum ActivityStatus {
     Sleeping,
     Watching,
     Attention,
+}
+
+impl ActivityStatus {
+    fn default_indicator(&self) -> &'static str {
+        match self {
+            Self::Unknown => "🫥",
+            Self::Idle => "🥱",
+            Self::Working => "🤖",
+            Self::Question => "🙋",
+            Self::Sleeping => "😴",
+            Self::Watching => "👀",
+            Self::Attention => "🔔",
+        }
+    }
 }
 
 impl Default for ActivityStatus {
@@ -677,6 +720,11 @@ States:
   watching  👀  Agent watching/monitoring
   attention 🔔  Needs attention
 
+Config (in plugin KDL):
+  status_unknown ""        Hide indicator when unknown
+  status_working "WRK"     Custom text shown as [WRK]
+  (set any status_* to "" to suppress the [brackets] entirely)
+
 Commands:
   --args help              Show this help
   --args list              List all tabs (alias: ls)
@@ -798,20 +846,16 @@ Examples:
                 };
 
                 if let Some(crew_tab) = crew_state {
-                    // Use leader's name with status indicator
-                    let indicator = match crew_tab.status {
-                        ActivityStatus::Unknown => "🫥",
-                        ActivityStatus::Idle => "🥱",
-                        ActivityStatus::Working => "🤖",
-                        ActivityStatus::Question => "🙋",
-                        ActivityStatus::Sleeping => "😴",
-                        ActivityStatus::Watching => "👀",
-                        ActivityStatus::Attention => "🔔",
-                    };
-                    format!("{} [{}]", crew_tab.name, indicator)
+                    match self.config.indicator_for(&crew_tab.status) {
+                        Some(ind) => format!("{} [{}]", crew_tab.name, ind),
+                        None => crew_tab.name.clone(),
+                    }
                 } else {
-                    // No crew state yet, show TabUpdate name
-                    format!("{} [🫥]", tab.name)
+                    // No crew state yet, use Unknown's indicator config
+                    match self.config.indicator_for(&ActivityStatus::Unknown) {
+                        Some(ind) => format!("{} [{}]", tab.name, ind),
+                        None => tab.name.to_string(),
+                    }
                 }
             })
             .collect();

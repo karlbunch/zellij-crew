@@ -32,6 +32,10 @@ beads.left.meta.json
 beads.right.jsonl
 beads.right.meta.json
 
+# JSONL lock files (runtime)
+.jsonl.lock
+*.jsonl.lock
+
 # Sync state (local-only, per-machine)
 # These files are machine-specific and should not be shared across clones
 .sync.lock

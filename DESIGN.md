@@ -26,6 +26,16 @@ plugins {
         mode "round-robin"      // or "fill-in"
         show_position "false"   // or "true" for "alpha <1>"
         rename_custom "false"   // or "true" to rename tabs with custom names
+
+        // Per-status indicator overrides (all optional, defaults to emoji)
+        // Set to "" to suppress the [brackets] entirely for that state
+        status_unknown ""       // hide indicator when no status
+        // status_idle "🥱"     // default
+        // status_working "🤖"  // default
+        // status_question "🙋" // default
+        // status_sleeping "😴" // default
+        // status_watching "👀" // default
+        // status_attention "🔔" // default
     }
 }
 ```
@@ -38,6 +48,13 @@ plugins {
 | `mode` | `round-robin`, `fill-in` | `round-robin` | Name allocation strategy |
 | `show_position` | `true`, `false` | `false` | Append tab position like "alpha <1>" |
 | `rename_custom` | `true`, `false` | `false` | Whether to rename tabs that already have custom names |
+| `status_unknown` | string | `"🫥"` | Indicator for unknown state (`""` to hide) |
+| `status_idle` | string | `"🥱"` | Indicator for idle state (`""` to hide) |
+| `status_working` | string | `"🤖"` | Indicator for working state (`""` to hide) |
+| `status_question` | string | `"🙋"` | Indicator for question state (`""` to hide) |
+| `status_sleeping` | string | `"😴"` | Indicator for sleeping state (`""` to hide) |
+| `status_watching` | string | `"👀"` | Indicator for watching state (`""` to hide) |
+| `status_attention` | string | `"🔔"` | Indicator for attention state (`""` to hide) |
 
 ### Allocation Modes
 
@@ -99,6 +116,7 @@ struct Config {
     names: Vec<String>,           // Name pool
     mode: AllocationMode,         // round-robin or fill-in
     hide_swap_layout_indication: bool,  // Whether to hide swap layout status
+    status_indicators: HashMap<ActivityStatus, String>,  // Per-status display overrides
     // show_position feature planned but not implemented
 }
 
@@ -817,13 +835,13 @@ plugins {
 - Name-based and pane-based status updates
 - Built-in help and list commands
 - Hook script (bin/zellij-crew-claude)
+- Configurable indicators (custom emoji/text per state via `status_*` config keys)
 
 **📋 Planned (see Future Enhancements below):**
 - Content analysis (automatic state detection from terminal output)
 - Timeout detection (sleeping state when no activity)
 - show_position feature (display "alpha <1>" style names)
 - Inter-agent messaging (tab-to-tab communication)
-- Configurable indicators (custom emoji/text per state)
 
 ## Default Tab-Bar Plugin Analysis
 
@@ -997,16 +1015,24 @@ zellij pipe --name zellij-crew:message --args "from=alice,to=bob,msg=What's the 
 
 ## Configurable Indicators
 
-Allow users to customize emoji/text for each activity state.
+**Status: ✅ Implemented**
+
+Each activity state's display indicator can be overridden via `status_*` plugin config keys.
+Setting a key to `""` suppresses the `[brackets]` entirely for that state. Omitting a key
+uses the default emoji.
+
+**Config keys:** `status_unknown`, `status_idle`, `status_working`, `status_question`, `status_sleeping`, `status_watching`, `status_attention`
 
 **Config example:**
 ```kdl
-crew {
+crew location="..." {
     names "alice bob carol"
-    indicator_working "⚡"
-    indicator_idle "💤"
-    indicator_question "❓"
+    status_unknown ""          // hide indicator when unknown (no brackets shown)
+    status_working "WRK"       // custom text shown as [WRK]
+    status_idle "💤"           // custom emoji
+    status_question "❓"
+    // status_sleeping omitted → uses default 😴
 }
 ```
 
-**Status:** Currently hardcoded in main.rs:736-744.
+**Implementation:** `Config::indicator_for()` in `src/main.rs` returns `Some(&str)` for the display string or `None` to suppress brackets. `ActivityStatus::default_indicator()` provides the fallback emoji for each state.

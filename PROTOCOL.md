@@ -186,8 +186,8 @@ Returns tab list via `cli_pipe_output()`.
 
 ## Valid States
 
-| State | Case-sensitive | Indicator |
-|-------|----------------|-----------|
+| State | Case-sensitive | Default Indicator |
+|-------|----------------|-------------------|
 | `unknown` | yes | 🫥 |
 | `idle` | yes | 🥱 |
 | `working` | yes | 🤖 |
@@ -197,6 +197,8 @@ Returns tab list via `cli_pipe_output()`.
 | `attention` | yes | 🔔 |
 
 Invalid states are rejected with error message.
+
+**Note:** Default indicators can be overridden via plugin config keys `status_unknown`, `status_idle`, etc. Setting a key to `""` suppresses the `[brackets]` entirely for that state. See [DESIGN.md](DESIGN.md) for details.
 
 ## Implementation Details
 
@@ -271,6 +273,11 @@ States:
   sleeping  😴  Agent sleeping/paused
   watching  👀  Agent watching/monitoring
   attention 🔔  Needs attention
+
+Config (in plugin KDL):
+  status_unknown ""        Hide indicator when unknown
+  status_working "WRK"     Custom text shown as [WRK]
+  (set any status_* to "" to suppress the [brackets] entirely)
 ...
 ```
 

@@ -766,6 +766,7 @@ Examples:
                             };
                             serde_json::json!({
                                 "id": tab.tab_id,
+                                "pos": tab.position,
                                 "name": tab.name,
                                 "status": status_str
                             })

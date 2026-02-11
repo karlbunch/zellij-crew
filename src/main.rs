@@ -7,6 +7,7 @@ mod tab;
 use std::cmp::{max, min};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::convert::TryInto;
+use std::time::SystemTime;
 
 use serde::{Deserialize, Serialize};
 use tab::get_tab_to_focus;
@@ -177,6 +178,7 @@ struct CrewTabState {
 #[derive(Default)]
 struct State {
     // Common state (both modes)
+    instance_id: String,  // unique per WASM instance for log disambiguation
     mode_info: ModeInfo,
     config: Config,
     first_render_done: bool,
@@ -234,7 +236,7 @@ impl State {
         let tabs: Vec<&CrewTabState> = self.known_tabs.values().collect();
 
         if let Ok(json) = serde_json::to_string(&tabs) {
-            eprintln!("[crew:leader] Broadcasting state: {} tabs", tabs.len());
+            eprintln!("[crew:{}:leader] Broadcasting state: {} tabs", self.instance_id, tabs.len());
 
             // Send to all crew instances via plugin_url
             pipe_message_to_plugin(
@@ -243,7 +245,7 @@ impl State {
                     .with_payload(json)
             );
         } else {
-            eprintln!("[crew:leader] ERROR: Failed to serialize state");
+            eprintln!("[crew:{}:leader] ERROR: Failed to serialize state", self.instance_id);
         }
     }
 
@@ -286,7 +288,7 @@ impl State {
     }
 
     fn handle_leader_tab_update(&mut self, tabs: &[TabInfo]) {
-        eprintln!("[crew:leader] Processing {} tabs", tabs.len());
+        eprintln!("[crew:{}:leader] Processing {} tabs", self.instance_id, tabs.len());
 
         // Store tabs for pane_id -> tab_id mapping
         self.leader_tabs = tabs.to_vec();
@@ -303,7 +305,7 @@ impl State {
                 if let Some(pending) = &crew_tab.pending_rename {
                     if pending == &tab.name {
                         // Pending rename confirmed
-                        eprintln!("[crew:leader] Rename confirmed: Tab #{} -> {} (pos {})", tab_id, tab.name, tab.position);
+                        eprintln!("[crew:{}:leader] Rename confirmed: Tab #{} -> {} (pos {})", self.instance_id, tab_id, tab.name, tab.position);
                         crew_tab.name = tab.name.clone();
                         crew_tab.position = tab.position;
                         crew_tab.pending_rename = None;
@@ -314,8 +316,8 @@ impl State {
                 } else if crew_tab.name == tab.name {
                     // Name match - update position if changed
                     if crew_tab.position != tab.position {
-                        eprintln!("[crew:leader] Tab #{} '{}' moved from position {} to {}",
-                            tab_id, tab.name, crew_tab.position, tab.position);
+                        eprintln!("[crew:{}:leader] Tab #{} '{}' moved from position {} to {}",
+                            self.instance_id, tab_id, tab.name, crew_tab.position, tab.position);
                         crew_tab.position = tab.position;
                     }
                     seen_tab_ids.insert(*tab_id);
@@ -332,8 +334,8 @@ impl State {
             for (tab_id, crew_tab) in self.known_tabs.iter_mut() {
                 if crew_tab.position == tab.position && crew_tab.pending_rename.is_none() {
                     // Same position, different name - user renamed it
-                    eprintln!("[crew:leader] Tab #{} at position {} renamed: '{}' -> '{}' (user-defined)",
-                        tab_id, tab.position, crew_tab.name, tab.name);
+                    eprintln!("[crew:{}:leader] Tab #{} at position {} renamed: '{}' -> '{}' (user-defined)",
+                        self.instance_id, tab_id, tab.position, crew_tab.name, tab.name);
                     crew_tab.name = tab.name.clone();
                     crew_tab.user_defined = true;
                     seen_tab_ids.insert(*tab_id);
@@ -360,7 +362,7 @@ impl State {
             if parse_default_name(&tab.name).is_some() && !self.known_tabs.contains_key(&tab_id) {
                 // New tab with default name - allocate a name from pool
                 if let Some(new_name) = self.allocate_from_pool() {
-                    eprintln!("[crew:leader] New tab: renaming Tab #{} -> {} (pos {})", tab_id, new_name, tab.position);
+                    eprintln!("[crew:{}:leader] New tab: renaming Tab #{} -> {} (pos {})", self.instance_id, tab_id, new_name, tab.position);
                     rename_tab(tab_id, new_name.clone());
 
                     self.known_tabs.insert(
@@ -376,12 +378,12 @@ impl State {
                     );
                     seen_tab_ids.insert(tab_id);
                 } else {
-                    eprintln!("[crew:leader] Pool exhausted, leaving Tab #{} unnamed", tab_id);
+                    eprintln!("[crew:{}:leader] Pool exhausted, leaving Tab #{} unnamed", self.instance_id, tab_id);
                 }
             } else if !seen_tab_ids.contains(&tab_id) {
                 // New tab with user-defined name - track it
-                eprintln!("[crew:leader] New tab with user-defined name: Tab #{} '{}' (pos {})",
-                    tab_id, tab.name, tab.position);
+                eprintln!("[crew:{}:leader] New tab with user-defined name: Tab #{} '{}' (pos {})",
+                    self.instance_id, tab_id, tab.name, tab.position);
                 self.known_tabs.insert(
                     tab_id,
                     CrewTabState {
@@ -408,9 +410,9 @@ impl State {
         for tab_id in closed {
             if let Some(crew_tab) = self.known_tabs.remove(&tab_id) {
                 if !crew_tab.user_defined {
-                    eprintln!("[crew:leader] Tab #{} '{}' closed, name returns to pool", tab_id, crew_tab.name);
+                    eprintln!("[crew:{}:leader] Tab #{} '{}' closed, name returns to pool", self.instance_id, tab_id, crew_tab.name);
                 } else {
-                    eprintln!("[crew:leader] Tab #{} '{}' closed (user-defined)", tab_id, crew_tab.name);
+                    eprintln!("[crew:{}:leader] Tab #{} '{}' closed (user-defined)", self.instance_id, tab_id, crew_tab.name);
                 }
             }
         }
@@ -425,7 +427,7 @@ impl State {
             if let Ok(json) = serde_json::from_str::<serde_json::Value>(payload) {
                 if let Some(to_name) = json.get("to").and_then(|v| v.as_str()) {
                     // Name-based message routing
-                    eprintln!("[crew:leader] Received message for '{}'", to_name);
+                    eprintln!("[crew:{}:leader] Received message for '{}'", self.instance_id, to_name);
                     // TODO: Store messages for named tabs
                     return true;
                 }
@@ -446,7 +448,7 @@ impl State {
             }
         }
 
-        eprintln!("[crew:leader] Unrecognized status pipe format");
+        eprintln!("[crew:{}:leader] Unrecognized status pipe format", self.instance_id);
         false
     }
 
@@ -461,7 +463,7 @@ impl State {
             "watching" => ActivityStatus::Watching,
             "attention" => ActivityStatus::Attention,
             _ => {
-                eprintln!("[crew:leader] Unrecognized status: {}", state_str);
+                eprintln!("[crew:{}:leader] Unrecognized status: {}", self.instance_id, state_str);
                 return false;
             }
         };
@@ -469,13 +471,13 @@ impl State {
         // Find tab by name
         if let Some(crew_tab) = self.known_tabs.values_mut().find(|t| t.name == name) {
             if crew_tab.status != new_status {
-                eprintln!("[crew:leader] Updating tab '{}' to status: {:?}", name, new_status);
+                eprintln!("[crew:{}:leader] Updating tab '{}' to status: {:?}", self.instance_id, name, new_status);
                 crew_tab.status = new_status;
                 self.broadcast_state();
                 return true;
             }
         } else {
-            eprintln!("[crew:leader] Tab '{}' not found", name);
+            eprintln!("[crew:{}:leader] Tab '{}' not found", self.instance_id, name);
         }
         false
     }
@@ -491,7 +493,7 @@ impl State {
             "watching" => ActivityStatus::Watching,
             "attention" => ActivityStatus::Attention,
             _ => {
-                eprintln!("[crew:leader] Unrecognized status: {}", state_str);
+                eprintln!("[crew:{}:leader] Unrecognized status: {}", self.instance_id, state_str);
                 return false;
             }
         };
@@ -500,7 +502,7 @@ impl State {
         let tab_position = if let Some(manifest) = &self.pane_manifest {
             let result = manifest.panes.iter().find_map(|(tab_pos, panes)| {
                 if panes.iter().any(|p| !p.is_plugin && p.id == pane_id) {
-                    eprintln!("[crew:leader] Found pane {} in tab position {}", pane_id, tab_pos);
+                    eprintln!("[crew:{}:leader] Found pane {} in tab position {}", self.instance_id, pane_id, tab_pos);
                     Some(*tab_pos)
                 } else {
                     None
@@ -508,26 +510,26 @@ impl State {
             });
 
             if result.is_none() {
-                eprintln!("[crew:leader] Pane {} not found in manifest (tabs: {})",
-                    pane_id, manifest.panes.len());
+                eprintln!("[crew:{}:leader] Pane {} not found in manifest (tabs: {})",
+                    self.instance_id, pane_id, manifest.panes.len());
             }
 
             result
         } else {
-            eprintln!("[crew:leader] No pane manifest available");
+            eprintln!("[crew:{}:leader] No pane manifest available", self.instance_id);
             None
         };
 
         if let Some(tab_pos) = tab_position {
-            eprintln!("[crew:leader] Looking for tab at position {} in {} tabs",
-                tab_pos, self.leader_tabs.len());
+            eprintln!("[crew:{}:leader] Looking for tab at position {} in {} tabs",
+                self.instance_id, tab_pos, self.leader_tabs.len());
 
             // Map tab position to tab_id from current tabs
             let tab_at_pos = self.leader_tabs.iter().find(|t| t.position == tab_pos);
 
             if let Some(tab) = tab_at_pos {
-                eprintln!("[crew:leader] Tab at position {}: name='{}' active={}",
-                    tab_pos, tab.name, tab.active);
+                eprintln!("[crew:{}:leader] Tab at position {}: name='{}' active={}",
+                    self.instance_id, tab_pos, tab.name, tab.active);
             }
 
             if let Some(tab_id) = tab_at_pos.and_then(|t| parse_default_name(&t.name).or_else(|| {
@@ -540,18 +542,18 @@ impl State {
                 // Update specific tab
                 if let Some(crew_tab) = self.known_tabs.get_mut(&tab_id) {
                     if crew_tab.status != new_status {
-                        eprintln!("[crew:leader] Updating tab '{}' (id={}) to status: {:?}",
-                            crew_tab.name, tab_id, new_status);
+                        eprintln!("[crew:{}:leader] Updating tab '{}' (id={}) to status: {:?}",
+                            self.instance_id, crew_tab.name, tab_id, new_status);
                         crew_tab.status = new_status;
                         self.broadcast_state();
                         return true;
                     }
                 }
             } else {
-                eprintln!("[crew:leader] Could not map tab_position {} to tab_id", tab_pos);
+                eprintln!("[crew:{}:leader] Could not map tab_position {} to tab_id", self.instance_id, tab_pos);
             }
         } else {
-            eprintln!("[crew:leader] Pane {} not found in any tab", pane_id);
+            eprintln!("[crew:{}:leader] Pane {} not found in any tab", self.instance_id, pane_id);
         }
 
         false
@@ -569,10 +571,17 @@ register_plugin!(State);
 
 impl ZellijPlugin for State {
     fn load(&mut self, configuration: BTreeMap<String, String>) {
+        // Generate a per-instance ID for log disambiguation across session resurrections
+        let nanos = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        self.instance_id = format!("{:08x}", (nanos & 0xFFFFFFFF) as u32);
+
         self.config = Config::from_btreemap(&configuration);
 
         let my_id = get_plugin_ids().plugin_id;
-        eprintln!("[crew:{}] load() config={:?}", my_id, configuration);
+        eprintln!("[crew:{}:plugin{}] load() config={:?}", self.instance_id, my_id, configuration);
 
         // Don't call set_selectable(false) here - we need to remain selectable
         // so the user can focus this pane and grant permission on first run
@@ -592,7 +601,7 @@ impl ZellijPlugin for State {
     }
 
     fn update(&mut self, event: Event) -> bool {
-        eprintln!("[crew] update() event={:?}", std::mem::discriminant(&event));
+        eprintln!("[crew:{}] update() event={:?}", self.instance_id, std::mem::discriminant(&event));
 
         let mut should_render = false;
         match event {
@@ -619,7 +628,7 @@ impl ZellijPlugin for State {
                         self.active_tab_idx = active_tab_idx;
                         self.tabs = tabs;
                     } else {
-                        eprintln!("[crew:renderer] Could not find active tab.");
+                        eprintln!("[crew:{}:renderer] Could not find active tab.", self.instance_id);
                     }
                 }
             }
@@ -643,7 +652,7 @@ impl ZellijPlugin for State {
                 should_render = !self.is_leader;
             }
             Event::PermissionRequestResult(PermissionStatus::Denied) => {
-                eprintln!("[crew] Permission denied - plugin will not function properly");
+                eprintln!("[crew:{}] Permission denied - plugin will not function properly", self.instance_id);
             }
             Event::Mouse(me) => {
                 if self.is_leader {
@@ -667,7 +676,7 @@ impl ZellijPlugin for State {
                 }
             }
             _ => {
-                eprintln!("[crew] Got unrecognized event: {:?}", event);
+                eprintln!("[crew:{}] Got unrecognized event: {:?}", self.instance_id, event);
             }
         }
         if self.tabs.is_empty() {
@@ -677,20 +686,20 @@ impl ZellijPlugin for State {
     }
 
     fn pipe(&mut self, pipe_message: PipeMessage) -> bool {
-        eprintln!("[crew] pipe() received: is_leader={} name='{}' source={:?}",
-            self.is_leader, pipe_message.name, pipe_message.source);
+        eprintln!("[crew:{}] pipe() received: is_leader={} name='{}' source={:?}",
+            self.instance_id, self.is_leader, pipe_message.name, pipe_message.source);
 
         // Renderers: receive internal crew-state broadcasts
         if !self.is_leader && pipe_message.name == "crew-state" {
             if let Some(payload) = pipe_message.payload {
                 match serde_json::from_str::<Vec<CrewTabState>>(&payload) {
                     Ok(tabs) => {
-                        eprintln!("[crew:renderer] Received state via pipe: {} tabs", tabs.len());
+                        eprintln!("[crew:{}:renderer] Received state via pipe: {} tabs", self.instance_id, tabs.len());
                         self.received_tabs = tabs;
                         return true; // Request render
                     }
                     Err(e) => {
-                        eprintln!("[crew:renderer] ERROR: Failed to parse state: {}", e);
+                        eprintln!("[crew:{}:renderer] ERROR: Failed to parse state: {}", self.instance_id, e);
                     }
                 }
             }
@@ -820,7 +829,7 @@ Examples:
         if !self.first_render_done {
             self.first_render_done = true;
             self.is_leader = rows > 1;
-            eprintln!("[crew] FIRST render() rows={} cols={} is_leader={}", rows, cols, self.is_leader);
+            eprintln!("[crew:{}] FIRST render() rows={} cols={} is_leader={}", self.instance_id, rows, cols, self.is_leader);
         }
 
         if self.is_leader {

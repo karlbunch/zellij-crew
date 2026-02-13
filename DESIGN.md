@@ -81,26 +81,28 @@ Close "b", new tab created → "b" (fills the gap)
 
 ## State Management
 
-The plugin maintains separate state for leader and renderer instances:
+All instances are tab-bar panes. They elect a leader among themselves.
 
 ```rust
 struct State {
-    // Common state (both modes)
-    mode_info: ModeInfo,          // Colors, palette, capabilities
-    config: Config,               // Name pool, allocation mode
-    first_render_done: bool,      // For leader detection
-    is_leader: bool,              // true for load_plugins instance, false for tab-bars
+    // Common state (all instances are tab-bar panes)
+    instance_id: String,
+    plugin_id: u32,           // From get_plugin_ids(), election tiebreaker (highest wins)
+    mode_info: ModeInfo,
+    config: Config,
+    is_leader: bool,          // Determined by election protocol
+    election_pending: bool,   // Waiting for election timeout
 
     // Leader-only state
     known_tabs: HashMap<u32, CrewTabState>,  // tab_id -> CrewTabState (source of truth)
     pane_manifest: Option<PaneManifest>,     // For mapping pane_id -> tab_id
-    leader_tabs: Vec<TabInfo>,               // Current tabs (for pane_id -> tab_id mapping)
-    last_assigned_idx: Option<usize>,        // For round-robin mode: index of last assigned name
+    last_assigned_idx: Option<usize>,        // For round-robin mode
+    inherited_state: Option<HashMap<u32, CrewTabState>>,  // From leader resign
 
-    // Renderer-only state
-    received_tabs: Vec<CrewTabState>,  // From leader broadcast
-    tabs: Vec<TabInfo>,                // From TabUpdate (for rendering tab bar)
-    active_tab_idx: usize,             // Currently focused tab
+    // All instances (for rendering)
+    received_tabs: Vec<CrewTabState>,  // From leader broadcast (renderers only)
+    tabs: Vec<TabInfo>,                // From TabUpdate
+    active_tab_idx: usize,
     tab_line: Vec<LinePart>,           // Cached for mouse clicks
 }
 
@@ -140,7 +142,7 @@ enum ActivityStatus {
 
 - **tab_id as HashMap key**: Tab IDs are stable (never change, even when tabs close/reorder). Parsed from "Tab #N" default name. Required for `rename_tab(tab_id, name)` API.
 - **pending_rename flag**: Prevents infinite rename loops. When we call `rename_tab()`, the next TabUpdate may still show the old name. We track pending renames to avoid re-renaming the same tab.
-- **is_leader detection**: Leader instance gets rows > 1 on first render (permission dialog size), renderers get rows ≤ 1. This allows single WASM binary to serve both roles.
+- **Leader election**: All instances are tab-bar panes. They elect a leader using a ping/ack/claim protocol with highest-plugin_id-wins tiebreaker. No `load_plugins` needed.
 - **Broadcast not query**: Leader broadcasts state to all renderers on every change. This is more efficient than renderers querying leader, and mirrors how zellij handles multi-user focus indicators.
 
 ## Event Flow
@@ -355,64 +357,43 @@ Visual indicators include:
 
 ## Architecture
 
-### Leader/Renderer Architecture
+### Pure Tab-Bar Architecture with Leader Election
 
-#### Discovery: Single Plugin, Dual Mode
-
-Through testing, we discovered that a single plugin binary can detect whether it was loaded
-via `load_plugins` (background) or in a layout pane (tab-bar), enabling a leader/renderer pattern:
+All instances are tab-bar panes. No `load_plugins` required. Instances self-organize
+using an election protocol.
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│              LEADER (load_plugins, background)              │
-│  - Detected by: first render has rows > 1                   │
-│  - Manages name assignments + activity state                │
-│  - Handles rename_tab() calls (no races)                    │
-│  - Broadcasts CrewState via pipe messages                   │
-│  - Plugin ID is typically lowest (e.g., id: 1)              │
-└─────────────────────────────────────────────────────────────┘
-                            │
-                            ▼ pipe: crew-state (broadcast)
-        ┌───────────────────┼───────────────────┐
-        ▼                   ▼                   ▼
-   [crew-bar 1]        [crew-bar 2]        [crew-bar N]
-   is_leader=false     is_leader=false     is_leader=false
-   rows=1 (tab-bar)    rows=1 (tab-bar)    rows=1 (tab-bar)
-   Stateless render    Stateless render    Stateless render
+    ┌───────────────────┬───────────────────┬───────────────────┐
+    ▼                   ▼                   ▼                   ▼
+[crew-bar 1]       [crew-bar 2]       [crew-bar 3]       [crew-bar N]
+ LEADER             renderer           renderer           renderer
+ plugin_id=2        plugin_id=4        plugin_id=6        plugin_id=2N
+ Manages state      Receives state     Receives state     Receives state
+ AND renders        Renders            Renders            Renders
 ```
 
-#### Leader Detection Mechanism
+#### Election Protocol
 
-The load_plugins instance receives a larger virtual pane on first render, even when
-permissions are already cached. Tab-bar instances get rows ≤ 1:
+On startup, each instance broadcasts a `crew-leader-ping` and sets a 0.3s timeout:
 
-```rust
-fn render(&mut self, rows: usize, cols: usize) {
-    if !self.first_render_done {
-        self.first_render_done = true;
-        self.is_leader = rows > 1;  // load_plugins gets rows=20, tab-bar gets rows=0 or 1
-    }
+1. **Ping**: Broadcast `crew-leader-ping` with own plugin_id
+2. **Ack**: If a leader exists, it responds with `crew-leader-ack` + serialized state
+3. **Claim**: If no ack within 0.3s, broadcast `crew-leader-claim` and become leader
+4. **Tiebreaker**: If two claims race, highest plugin_id wins (newer instances get higher IDs)
+5. **Resign**: On `BeforeClose`, leader broadcasts `crew-leader-resign` + state; survivors re-elect
 
-    if self.is_leader {
-        // Don't render anything - background instance
-        // Handle state management, broadcast via pipe
-        return;
-    }
+See [PROTOCOL.md](PROTOCOL.md) for message format details.
 
-    // Renderer mode - draw tab bar from received state
-}
-```
+#### Why Highest Plugin ID Wins
 
-**Test Results:**
-```
-[id: 1] FIRST render() rows=20 cols=88 is_leader=true   <- load_plugins
-[id: 2] FIRST render() rows=0 cols=180 is_leader=false  <- tab-bar
-[id: 4] FIRST render() rows=0 cols=180 is_leader=false  <- new tab's tab-bar
-```
+Newer instances get higher plugin IDs in zellij. This means:
+- `start-or-reload-plugin` replacements naturally win elections
+- Fresh code always takes over from stale code
+- No ambiguity about which instance is "newer"
 
 #### Configuration
 
-**config.kdl** - Load the leader instance:
+**config.kdl** - Define the plugin:
 ```kdl
 plugins {
     crew location="file:~/.config/zellij/zellij-crew.wasm" {
@@ -420,18 +401,14 @@ plugins {
         mode "fill-in"
     }
 }
-
-load_plugins {
-    "crew"  # Background leader instance
-}
 ```
 
-**layouts/crew-bar.kdl** - Load renderer instances per tab:
+**layouts/crew-bar.kdl** - Use in tab template:
 ```kdl
 layout {
     default_tab_template {
         pane size=1 borderless=true {
-            plugin location="crew"  # Renderer in each tab
+            plugin location="crew"
         }
         children
         pane size=1 borderless=true {
@@ -440,18 +417,6 @@ layout {
     }
 }
 ```
-
-#### Why This Works (Like Focus Indicators)
-
-This mirrors how zellij's built-in focus indicators work:
-- Server maintains authoritative state (which client focuses which tab)
-- Server broadcasts via TabInfo.other_focused_clients
-- Each tab-bar instance renders the same thing (stateless)
-
-For crew:
-- Leader maintains authoritative state (name assignments, activity)
-- Leader broadcasts via pipe messages
-- Each renderer instance renders from received state (stateless)
 
 #### Tab Name Stability
 
@@ -462,6 +427,17 @@ After `rename_tab()` succeeds:
 - Track assigned names by `tab.name` (not position)
 
 This solves the original position-based bug where names would shift when middle tabs closed.
+
+#### Edge Cases
+
+| Scenario | Behavior |
+|----------|----------|
+| First startup (1 tab) | 0.3s delay, then leader claims, renames tab |
+| New tab opens | New instance pings, leader acks, renderer stays |
+| `start-or-reload-plugin` | BeforeClose resign, new instance wins election |
+| Leader tab closed | BeforeClose resign, survivors elect with inherited state |
+| Leader crash (no BeforeClose) | Tab names survive (already renamed). New tab triggers election. Status resets to Unknown. |
+| Simultaneous tab opens | Race resolved by highest plugin_id |
 
 ### Core Principle: Separation of Concerns
 
@@ -826,16 +802,19 @@ plugins {
 
 **✅ Completed:**
 - Tab-bar foundation (forked from zellij default tab-bar)
-- Leader/renderer architecture (single WASM binary, dual mode)
+- Pure tab-bar architecture with leader election (no `load_plugins` needed)
+- Leader election protocol (ping/ack/claim/resign with highest-plugin_id tiebreaker)
 - Name allocation (round-robin and fill-in modes)
 - Activity status system (7 states with emoji indicators)
 - Pipe integration (external control via zellij-crew:status)
 - State broadcasting (leader → renderers via crew-state pipe)
+- State inheritance on leader handoff (BeforeClose resign)
 - Pane ID → tab mapping (via PaneManifest)
 - Name-based and pane-based status updates
 - Built-in help and list commands
 - Hook script (bin/zellij-crew-claude)
 - Configurable indicators (custom emoji/text per state via `status_*` config keys)
+- Makefile with build/install/reload/clean targets
 
 **📋 Planned (see Future Enhancements below):**
 - Content analysis (automatic state detection from terminal output)

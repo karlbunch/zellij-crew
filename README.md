@@ -7,40 +7,48 @@ A zellij tab-bar plugin that automatically names tabs and displays activity stat
 - **Activity indicators**: Visual status per tab (🫥 🥱 🤖 🙋 😴 👀 🔔)
 - **External control**: Update status via pipe messages (integrates with Claude Code, shell hooks)
 - **Smart allocation**: Fill-in or round-robin modes
-- **Leader/renderer architecture**: Single binary, multiple instances, one source of truth
+- **Self-organizing**: All instances are tab-bar panes; they elect a leader among themselves
 
 ## Installation
 
-Build the plugin:
+Build and install:
 
 ```bash
-cargo build --release
+make install    # builds WASM and copies to ~/.config/zellij/
 ```
 
-The WASM binary will be at `target/wasm32-wasip1/release/zellij-crew.wasm`.
+Or manually:
 
-Copy it to your zellij plugins directory or reference it directly in your configuration.
+```bash
+cargo build --target wasm32-wasip1 --release
+cp target/wasm32-wasip1/release/zellij-crew.wasm ~/.config/zellij/
+```
+
+### Makefile Targets
+
+| Target | Description |
+|--------|-------------|
+| `make build` | Build the WASM plugin |
+| `make install` | Build and copy to `~/.config/zellij/` |
+| `make reload` | Install and hot-reload in current session |
+| `make clean` | `cargo clean` |
 
 ## Architecture
 
-Crew uses a **leader/renderer architecture** for efficient state management:
+Crew uses a **pure tab-bar architecture with leader election**:
 
-- **Leader** (loaded via `load_plugins`): Manages tab names, handles renames, tracks activity status
-- **Renderers** (loaded per-tab in layout): Display tab bar with names and activity indicators from leader
+- All instances are tab-bar panes (no `load_plugins` needed)
+- On startup, instances elect a leader using a simple protocol (highest plugin_id wins)
+- The **leader** manages tab names, handles renames, tracks activity status, AND renders
+- **Renderers** display the tab bar using state broadcast from the leader
+- When the leader's tab closes, survivors inherit state and elect a new leader
+- `start-or-reload-plugin` triggers clean leadership handoff via BeforeClose/resign
 
-**How it works:**
-- Single WASM binary serves both roles (detected by render dimensions on first call)
-- Leader tracks state per tab (name, activity status, user-defined flag)
-- Leader broadcasts state to all renderers via pipe messages
-- Renderers are stateless - they just paint what leader broadcasts
-- Activity status updates from external tools (Claude Code, shell hooks) go to leader
-- All instances share same binary, no code duplication
-
-See [DESIGN.md](DESIGN.md) for detailed architecture documentation.
+See [DESIGN.md](DESIGN.md) for architecture details and [PROTOCOL.md](PROTOCOL.md) for message specs.
 
 ## Usage
 
-**1. Configure in config.kdl:**
+**1. Define the plugin in config.kdl:**
 
 ```kdl
 plugins {
@@ -49,19 +57,15 @@ plugins {
         mode "fill-in"
     }
 }
-
-load_plugins {
-    "crew"  # Leader instance (background)
-}
 ```
 
-**2. Use in layout (optional):**
+**2. Use in layout:**
 
 ```kdl
 layout {
     default_tab_template {
         pane size=1 borderless=true {
-            plugin location="crew"  # Renderer per tab
+            plugin location="crew"
         }
         children
         pane size=1 borderless=true {
@@ -76,25 +80,23 @@ Save as `~/.config/zellij/layouts/crew-bar.kdl` and start with:
 zellij --layout crew-bar
 ```
 
+No `load_plugins` block is needed. The tab-bar instances self-organize via leader election.
+
 ## Configuration
 
 Add to your zellij config (`~/.config/zellij/config.kdl`):
 
 ```kdl
 plugins {
-    crew location="file:/path/to/zellij-crew.wasm" {
+    crew location="file:~/.config/zellij/zellij-crew.wasm" {
         names "alice bob carol dave eve frank grace henry iris jack"
         mode "fill-in"
         hide_swap_layout_indication "false"
     }
 }
-
-load_plugins {
-    "crew"
-}
 ```
 
-The plugin loads in the background via `load_plugins` (leader instance) and in each tab via layout (renderer instances). Restart zellij for config changes to take effect.
+The plugin runs as a tab-bar pane in each tab (via layout). Instances elect a leader among themselves. Restart zellij for config changes to take effect.
 
 ### Options
 

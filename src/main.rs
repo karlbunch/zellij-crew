@@ -42,6 +42,14 @@ pub static ARROW_SEPARATOR: &str = "\u{e0b0}";
 
 const DEFAULT_NAMES: &str = "alpha bravo charlie delta echo foxtrot golf hotel india juliet kilo lima mike november oscar papa quebec romeo sierra tango uniform victor whiskey xray yankee zulu";
 
+// Election protocol: all tab-bar instances elect a leader among themselves.
+// Tiebreaker: highest plugin_id wins (newer instances get higher IDs).
+const ELECTION_TIMEOUT_SECS: f64 = 0.3;
+const MSG_LEADER_PING: &str = "crew-leader-ping";
+const MSG_LEADER_ACK: &str = "crew-leader-ack";
+const MSG_LEADER_CLAIM: &str = "crew-leader-claim";
+const MSG_LEADER_RESIGN: &str = "crew-leader-resign";
+
 #[derive(Debug, Clone, PartialEq)]
 enum AllocationMode {
     RoundRobin,
@@ -177,29 +185,25 @@ struct CrewTabState {
 
 #[derive(Default)]
 struct State {
-    // Common state (both modes)
-    instance_id: String,  // unique per WASM instance for log disambiguation
+    // Common state (all instances are tab-bar panes)
+    instance_id: String,
+    plugin_id: u32,           // From get_plugin_ids(), election tiebreaker (highest wins)
     mode_info: ModeInfo,
     config: Config,
-    first_render_done: bool,
-    is_leader: bool,
+    is_leader: bool,          // Determined by election protocol
+    election_pending: bool,   // Waiting for election timeout
 
     // Leader-only state
-    // ADR: Why HashMap<u32, CrewTabState> with tab_id as key?
-    // - tab_id is stable (never changes, even when tabs close/reorder)
-    // - Parsed from "Tab #N" default name (N is the tab_id)
-    // - Required for rename_tab(tab_id, name) API
-    // - O(1) lookup when confirming renames or updating status
     known_tabs: HashMap<u32, CrewTabState>,  // tab_id -> CrewTabState
     pane_manifest: Option<PaneManifest>,     // For mapping pane_id -> tab
-    leader_tabs: Vec<TabInfo>,               // Current tabs (for pane_id -> tab_id mapping)
     last_assigned_idx: Option<usize>,
+    inherited_state: Option<HashMap<u32, CrewTabState>>,  // From leader resign
 
-    // Renderer-only state
-    received_tabs: Vec<CrewTabState>,  // From leader broadcast
-    tabs: Vec<TabInfo>,            // From TabUpdate (for rendering)
+    // All instances (for rendering)
+    received_tabs: Vec<CrewTabState>,  // From leader broadcast (renderers only)
+    tabs: Vec<TabInfo>,                // From TabUpdate
     active_tab_idx: usize,
-    tab_line: Vec<LinePart>,       // Cached for mouse clicks
+    tab_line: Vec<LinePart>,           // Cached for mouse clicks
 }
 
 // ============================================================================
@@ -216,18 +220,70 @@ fn parse_default_name(name: &str) -> Option<u32> {
 }
 
 // ============================================================================
+// Leader Election
+// ============================================================================
+
+impl State {
+    fn start_election(&mut self) {
+        self.election_pending = true;
+        let payload = serde_json::json!({"plugin_id": self.plugin_id});
+        eprintln!("[crew:{}:plugin{}] Starting election", self.instance_id, self.plugin_id);
+        pipe_message_to_plugin(
+            MessageToPlugin::new(MSG_LEADER_PING)
+                .with_plugin_url("crew")
+                .with_payload(serde_json::to_string(&payload).unwrap_or_default()),
+        );
+        set_timeout(ELECTION_TIMEOUT_SECS);
+    }
+
+    fn become_leader(&mut self) {
+        self.is_leader = true;
+        self.election_pending = false;
+        eprintln!("[crew:{}:plugin{}] Became LEADER", self.instance_id, self.plugin_id);
+
+        // Adopt inherited state if present (from a resign message)
+        if let Some(inherited) = self.inherited_state.take() {
+            eprintln!("[crew:{}:leader] Adopting {} inherited tabs", self.instance_id, inherited.len());
+            self.known_tabs = inherited;
+        }
+
+        // Broadcast claim so others know
+        let payload = serde_json::json!({"plugin_id": self.plugin_id});
+        pipe_message_to_plugin(
+            MessageToPlugin::new(MSG_LEADER_CLAIM)
+                .with_plugin_url("crew")
+                .with_payload(serde_json::to_string(&payload).unwrap_or_default()),
+        );
+
+        self.broadcast_state();
+    }
+
+    fn resign_leadership(&mut self) {
+        if !self.is_leader {
+            return;
+        }
+        eprintln!("[crew:{}:leader] Resigning leadership", self.instance_id);
+
+        let state: Vec<&CrewTabState> = self.known_tabs.values().collect();
+        let payload = serde_json::json!({
+            "plugin_id": self.plugin_id,
+            "state": state,
+        });
+        pipe_message_to_plugin(
+            MessageToPlugin::new(MSG_LEADER_RESIGN)
+                .with_plugin_url("crew")
+                .with_payload(serde_json::to_string(&payload).unwrap_or_default()),
+        );
+
+        self.is_leader = false;
+    }
+}
+
+// ============================================================================
 // Leader State Management
 // ============================================================================
 
 impl State {
-    // ADR: Why broadcast instead of query?
-    // We could have renderers query the leader for state, but broadcasting is more efficient:
-    // - Query: N renderers × M queries/sec = N×M messages (grows with renderer count)
-    // - Broadcast: 1 broadcast on state change (typically 0-5/sec, independent of renderer count)
-    // - Mirrors how zellij handles multi-user focus indicators (broadcast TabInfo.other_focused_clients)
-    // - Simpler: renderers are stateless, just paint what they receive
-    // - No race conditions: all renderers see same state at same time
-    // Trade-off: Small delay when new renderer starts (waits for next state change)
     fn broadcast_state(&self) {
         if !self.is_leader {
             return; // Only leader broadcasts
@@ -238,11 +294,10 @@ impl State {
         if let Ok(json) = serde_json::to_string(&tabs) {
             eprintln!("[crew:{}:leader] Broadcasting state: {} tabs", self.instance_id, tabs.len());
 
-            // Send to all crew instances via plugin_url
             pipe_message_to_plugin(
                 MessageToPlugin::new("crew-state")
-                    .with_plugin_url("crew")  // Routes to all instances with this URL
-                    .with_payload(json)
+                    .with_plugin_url("crew")
+                    .with_payload(json),
             );
         } else {
             eprintln!("[crew:{}:leader] ERROR: Failed to serialize state", self.instance_id);
@@ -289,9 +344,6 @@ impl State {
 
     fn handle_leader_tab_update(&mut self, tabs: &[TabInfo]) {
         eprintln!("[crew:{}:leader] Processing {} tabs", self.instance_id, tabs.len());
-
-        // Store tabs for pane_id -> tab_id mapping
-        self.leader_tabs = tabs.to_vec();
 
         // Track which tab IDs we've seen in this update
         let mut seen_tab_ids = HashSet::new();
@@ -522,10 +574,10 @@ impl State {
 
         if let Some(tab_pos) = tab_position {
             eprintln!("[crew:{}:leader] Looking for tab at position {} in {} tabs",
-                self.instance_id, tab_pos, self.leader_tabs.len());
+                self.instance_id, tab_pos, self.tabs.len());
 
             // Map tab position to tab_id from current tabs
-            let tab_at_pos = self.leader_tabs.iter().find(|t| t.position == tab_pos);
+            let tab_at_pos = self.tabs.iter().find(|t| t.position == tab_pos);
 
             if let Some(tab) = tab_at_pos {
                 eprintln!("[crew:{}:leader] Tab at position {}: name='{}' active={}",
@@ -560,9 +612,6 @@ impl State {
     }
 }
 
-// Name allocation logic is in allocate_from_pool() (lines 191-227)
-// Old per-tab iteration approach was removed during leader/renderer refactor
-
 // ============================================================================
 // Plugin Implementation
 // ============================================================================
@@ -579,9 +628,9 @@ impl ZellijPlugin for State {
         self.instance_id = format!("{:08x}", (nanos & 0xFFFFFFFF) as u32);
 
         self.config = Config::from_btreemap(&configuration);
+        self.plugin_id = get_plugin_ids().plugin_id;
 
-        let my_id = get_plugin_ids().plugin_id;
-        eprintln!("[crew:{}:plugin{}] load() config={:?}", self.instance_id, my_id, configuration);
+        eprintln!("[crew:{}:plugin{}] load() config={:?}", self.instance_id, self.plugin_id, configuration);
 
         // Don't call set_selectable(false) here - we need to remain selectable
         // so the user can focus this pane and grant permission on first run
@@ -596,8 +645,13 @@ impl ZellijPlugin for State {
             EventType::PaneUpdate,
             EventType::ModeUpdate,
             EventType::Mouse,
+            EventType::Timer,
+            EventType::BeforeClose,
             EventType::PermissionRequestResult,
         ]);
+
+        // Start leader election instead of relying on render-time detection
+        self.start_election();
     }
 
     fn update(&mut self, event: Event) -> bool {
@@ -612,52 +666,60 @@ impl ZellijPlugin for State {
                 self.mode_info = mode_info;
             }
             Event::TabUpdate(tabs) => {
-                if self.is_leader {
-                    // Leader: manage tab names
-                    self.handle_leader_tab_update(&tabs);
-                    // Leader doesn't render
-                    should_render = false;
-                } else {
-                    // Renderer: store tabs for rendering
-                    if let Some(active_tab_index) = tabs.iter().position(|t| t.active) {
-                        let active_tab_idx = active_tab_index + 1;
+                // All instances: store tabs for rendering
+                if let Some(active_tab_index) = tabs.iter().position(|t| t.active) {
+                    let active_tab_idx = active_tab_index + 1;
 
-                        if self.active_tab_idx != active_tab_idx || self.tabs != tabs {
-                            should_render = true;
-                        }
-                        self.active_tab_idx = active_tab_idx;
-                        self.tabs = tabs;
-                    } else {
-                        eprintln!("[crew:{}:renderer] Could not find active tab.", self.instance_id);
+                    if self.active_tab_idx != active_tab_idx || self.tabs != tabs {
+                        should_render = true;
                     }
+                    self.active_tab_idx = active_tab_idx;
+                } else {
+                    eprintln!("[crew:{}] Could not find active tab.", self.instance_id);
                 }
+                // Leader additionally manages tab names
+                if self.is_leader {
+                    self.handle_leader_tab_update(&tabs);
+                }
+                self.tabs = tabs;
             }
             Event::PaneUpdate(pane_manifest) => {
                 if self.is_leader {
                     // Leader: store pane manifest for pane_id -> tab mapping
                     self.pane_manifest = Some(pane_manifest);
                 }
-                // Renderers don't need pane info
                 should_render = false;
             }
-            Event::PermissionRequestResult(PermissionStatus::Granted) => {
-                if !self.is_leader {
-                    set_selectable(false);
+            Event::Timer(_) => {
+                if self.election_pending {
+                    // No ack received within timeout, claim leadership
+                    self.become_leader();
+                    // Process current tabs now that we're leader
+                    if !self.tabs.is_empty() {
+                        let tabs = self.tabs.clone();
+                        self.handle_leader_tab_update(&tabs);
+                    }
+                    should_render = true;
                 }
+            }
+            Event::BeforeClose => {
+                self.resign_leadership();
+            }
+            Event::PermissionRequestResult(PermissionStatus::Granted) => {
+                set_selectable(false);
                 subscribe(&[
                     EventType::TabUpdate,
                     EventType::ModeUpdate,
                     EventType::Mouse,
+                    EventType::Timer,
+                    EventType::BeforeClose,
                 ]);
-                should_render = !self.is_leader;
+                should_render = true;
             }
             Event::PermissionRequestResult(PermissionStatus::Denied) => {
                 eprintln!("[crew:{}] Permission denied - plugin will not function properly", self.instance_id);
             }
             Event::Mouse(me) => {
-                if self.is_leader {
-                    return false;  // Leader doesn't handle mouse
-                }
                 match me {
                     Mouse::LeftClick(_, col) => {
                         let tab_to_focus =
@@ -689,7 +751,102 @@ impl ZellijPlugin for State {
         eprintln!("[crew:{}] pipe() received: is_leader={} name='{}' source={:?}",
             self.instance_id, self.is_leader, pipe_message.name, pipe_message.source);
 
-        // Renderers: receive internal crew-state broadcasts
+        // ---- Election protocol messages ----
+
+        if pipe_message.name == MSG_LEADER_PING {
+            if let Some(payload) = &pipe_message.payload {
+                if let Ok(msg) = serde_json::from_str::<serde_json::Value>(payload) {
+                    let sender_id = msg["plugin_id"].as_u64().unwrap_or(0) as u32;
+                    if sender_id != self.plugin_id && self.is_leader {
+                        // We're the leader, respond with ack + state
+                        eprintln!("[crew:{}:leader] Acking ping from plugin {}", self.instance_id, sender_id);
+                        let state: Vec<&CrewTabState> = self.known_tabs.values().collect();
+                        let ack = serde_json::json!({
+                            "plugin_id": self.plugin_id,
+                            "state": state,
+                        });
+                        pipe_message_to_plugin(
+                            MessageToPlugin::new(MSG_LEADER_ACK)
+                                .with_plugin_url("crew")
+                                .with_payload(serde_json::to_string(&ack).unwrap_or_default()),
+                        );
+                    }
+                }
+            }
+            return false;
+        }
+
+        if pipe_message.name == MSG_LEADER_ACK {
+            if let Some(payload) = &pipe_message.payload {
+                if let Ok(msg) = serde_json::from_str::<serde_json::Value>(payload) {
+                    let sender_id = msg["plugin_id"].as_u64().unwrap_or(0) as u32;
+                    if sender_id != self.plugin_id && self.election_pending {
+                        // Cancel election, stay renderer
+                        eprintln!("[crew:{}] Received ack from leader (plugin {}), staying renderer",
+                            self.instance_id, sender_id);
+                        self.election_pending = false;
+                        // Parse state from ack for immediate rendering
+                        if let Some(state_val) = msg.get("state") {
+                            if let Ok(tabs) = serde_json::from_value::<Vec<CrewTabState>>(state_val.clone()) {
+                                self.received_tabs = tabs;
+                                return true; // Re-render with received state
+                            }
+                        }
+                    }
+                }
+            }
+            return false;
+        }
+
+        if pipe_message.name == MSG_LEADER_CLAIM {
+            if let Some(payload) = &pipe_message.payload {
+                if let Ok(msg) = serde_json::from_str::<serde_json::Value>(payload) {
+                    let claimer_id = msg["plugin_id"].as_u64().unwrap_or(0) as u32;
+                    if claimer_id != self.plugin_id {
+                        if self.is_leader && claimer_id > self.plugin_id {
+                            // Higher ID wins, we yield
+                            eprintln!("[crew:{}:leader] Yielding to plugin {} (higher ID)",
+                                self.instance_id, claimer_id);
+                            self.is_leader = false;
+                        }
+                        if self.election_pending && claimer_id > self.plugin_id {
+                            // Higher ID is claiming, cancel our election
+                            eprintln!("[crew:{}] Higher-ID plugin {} claimed, canceling election",
+                                self.instance_id, claimer_id);
+                            self.election_pending = false;
+                        }
+                    }
+                }
+            }
+            return false;
+        }
+
+        if pipe_message.name == MSG_LEADER_RESIGN {
+            if let Some(payload) = &pipe_message.payload {
+                if let Ok(msg) = serde_json::from_str::<serde_json::Value>(payload) {
+                    let resigner_id = msg["plugin_id"].as_u64().unwrap_or(0) as u32;
+                    if resigner_id != self.plugin_id {
+                        eprintln!("[crew:{}] Leader (plugin {}) resigned, starting new election",
+                            self.instance_id, resigner_id);
+                        // Parse inherited state
+                        if let Some(state_val) = msg.get("state") {
+                            if let Ok(tabs) = serde_json::from_value::<Vec<CrewTabState>>(state_val.clone()) {
+                                let map: HashMap<u32, CrewTabState> = tabs.into_iter()
+                                    .map(|t| (t.tab_id, t))
+                                    .collect();
+                                self.inherited_state = Some(map);
+                            }
+                        }
+                        // Start new election
+                        self.start_election();
+                    }
+                }
+            }
+            return false;
+        }
+
+        // ---- Internal crew-state broadcasts ----
+
         if !self.is_leader && pipe_message.name == "crew-state" {
             if let Some(payload) = pipe_message.payload {
                 match serde_json::from_str::<Vec<CrewTabState>>(&payload) {
@@ -706,7 +863,8 @@ impl ZellijPlugin for State {
             return false;
         }
 
-        // Leader: handle external zellij-crew:status messages
+        // ---- External zellij-crew:status messages (leader only) ----
+
         if self.is_leader && pipe_message.name == "zellij-crew:status" {
             // Help command - check args or payload
             let is_help = pipe_message.args.contains_key("help")
@@ -816,43 +974,30 @@ Examples:
         false
     }
 
-    fn render(&mut self, rows: usize, cols: usize) {
-        // ADR: Why rows > 1 for leader detection?
-        // Through testing, we discovered that load_plugins instances receive a larger virtual
-        // pane on first render (rows=20 even after permissions cached), while layout-based
-        // tab-bar instances get rows ≤ 1. This allows a single WASM binary to serve both
-        // roles without config changes. Alternative approaches considered:
-        // - Separate binaries: Code duplication, harder to maintain
-        // - Config flag: User must configure twice (error-prone)
-        // - Plugin ID detection: IDs are not deterministic across restarts
-        // The rows heuristic is robust and requires no user configuration.
-        if !self.first_render_done {
-            self.first_render_done = true;
-            self.is_leader = rows > 1;
-            eprintln!("[crew:{}] FIRST render() rows={} cols={} is_leader={}", self.instance_id, rows, cols, self.is_leader);
-        }
-
-        if self.is_leader {
-            // Leader doesn't render anything
-            return;
-        }
-
+    fn render(&mut self, _rows: usize, cols: usize) {
         if self.tabs.is_empty() {
             // Don't render anything - let zellij show its permission dialog cleanly
             return;
         }
 
-        // Renderer: get names from received_tabs (leader state) or fall back to TabUpdate
+        // Build display names: leader uses known_tabs, renderer uses received_tabs
         let names: Vec<String> = self.tabs
             .iter()
             .map(|tab| {
-                // Try to find crew state for this tab
-                let crew_state = if let Some(tab_id) = parse_default_name(&tab.name) {
-                    // Tab still has default name, look up by tab_id
-                    self.received_tabs.iter().find(|ct| ct.tab_id == tab_id)
+                let crew_state: Option<&CrewTabState> = if self.is_leader {
+                    // Leader: look up from own state
+                    if let Some(tab_id) = parse_default_name(&tab.name) {
+                        self.known_tabs.get(&tab_id)
+                    } else {
+                        self.known_tabs.values().find(|ct| ct.name == tab.name)
+                    }
                 } else {
-                    // Tab has been renamed, look up by name
-                    self.received_tabs.iter().find(|ct| ct.name == tab.name)
+                    // Renderer: look up from leader broadcast
+                    if let Some(tab_id) = parse_default_name(&tab.name) {
+                        self.received_tabs.iter().find(|ct| ct.tab_id == tab_id)
+                    } else {
+                        self.received_tabs.iter().find(|ct| ct.name == tab.name)
+                    }
                 };
 
                 if let Some(crew_tab) = crew_state {
@@ -930,11 +1075,12 @@ Examples:
 // Tests
 // ============================================================================
 
-// Tests disabled during leader/renderer architecture migration
-// TODO: Rewrite tests for new architecture (see TESTING.md)
+// Tests disabled during leader election architecture migration
+// TODO: Rewrite tests for new architecture
 //
 // Test areas needed:
 // - Name allocation (round-robin, fill-in)
-// - Leader/renderer state broadcast
+// - Leader election protocol
+// - State broadcast and inheritance
 // - Pipe protocol handling (status updates, list command)
 // - Tab rename confirmation loop

@@ -4,16 +4,104 @@ This document specifies the pipe message protocols used by zellij-crew.
 
 ## Protocol Overview
 
-Crew uses two separate pipe protocols:
+Crew uses three protocol categories:
 
-1. **crew-state** (internal): Leader → Renderers state broadcast
-2. **zellij-crew:status** (external): External tools → Leader activity updates
+1. **Election** (internal): Leader election among tab-bar instances
+2. **crew-state** (internal): Leader → Renderers state broadcast
+3. **zellij-crew:status** (external): External tools → Leader activity updates
 
-Both protocols use zellij's pipe messaging system (`zellij pipe` command).
+All protocols use zellij's pipe messaging system.
 
 ---
 
-# Protocol 1: crew-state (Internal)
+# Protocol 1: Leader Election (Internal)
+
+**Purpose:** All instances are tab-bar panes. They elect a leader using a ping/ack/claim protocol.
+
+**Direction:** Broadcast (all instances ↔ all instances)
+
+**Tiebreaker:** Highest `plugin_id` wins (newer instances get higher IDs).
+
+## Message Types
+
+### crew-leader-ping
+
+**Trigger:** `load()` on every new instance
+
+**Payload:**
+```json
+{"plugin_id": 123}
+```
+
+**Behavior:** Instance broadcasts ping and sets 0.3s timeout. If an existing leader receives the ping, it responds with an ack.
+
+### crew-leader-ack
+
+**Trigger:** Leader receives a ping from another instance
+
+**Payload:**
+```json
+{
+  "plugin_id": 456,
+  "state": [{"tab_id": 1, "position": 0, "name": "alice", ...}, ...]
+}
+```
+
+**Behavior:** The pinging instance cancels its election, stays as renderer, and adopts the state for immediate rendering.
+
+### crew-leader-claim
+
+**Trigger:** Election timeout (0.3s) with no ack received
+
+**Payload:**
+```json
+{"plugin_id": 123}
+```
+
+**Behavior:** Instance declares itself leader. If a current leader has a lower plugin_id, it yields. If another instance with election pending has a higher plugin_id, it ignores the claim (it will claim when its own timeout fires).
+
+### crew-leader-resign
+
+**Trigger:** `BeforeClose` event on the leader (tab closing, plugin reload)
+
+**Payload:**
+```json
+{
+  "plugin_id": 456,
+  "state": [{"tab_id": 1, "position": 0, "name": "alice", ...}, ...]
+}
+```
+
+**Behavior:** Survivors store the inherited state and start a new election. The winner adopts the state, preserving tab names and activity status.
+
+## Election Flow
+
+```
+Instance A (new)              Leader B (existing)
+     │                              │
+     ├─── crew-leader-ping ────────►│
+     │                              ├─── crew-leader-ack ──────►A
+     │◄─────────────────────────────┤
+     │  (cancel election,           │
+     │   stay renderer)             │
+```
+
+**No leader exists:**
+```
+Instance A                    Instance B
+     │                              │
+     ├─── crew-leader-ping ────────►│  (ignored, B not leader)
+     │                              ├─── crew-leader-ping ──────►A (ignored, A not leader)
+     │  ... 0.3s timeout ...        │  ... 0.3s timeout ...
+     ├─── crew-leader-claim ───────►│
+     │                              ├─── crew-leader-claim ─────►A
+     │  (if B.id > A.id: A yields)  │  (if A.id > B.id: B yields)
+     │  Highest plugin_id wins      │
+```
+
+---
+
+# Protocol 2: crew-state (Internal)
 
 **Purpose:** Leader broadcasts CrewTabState to all renderer instances
 
@@ -65,7 +153,7 @@ fn broadcast_state(&self) {
 **Key points:**
 - Uses `with_plugin_url("crew")` WITHOUT `with_destination_plugin_id()` = broadcast
 - All crew instances (leader + renderers) receive the message
-- Instances filter by `is_leader` flag to determine handling
+- Leader ignores its own broadcasts; renderers parse and re-render
 
 ### Renderer (Receiver)
 
@@ -233,7 +321,7 @@ fn pipe(&mut self, pipe_message: PipeMessage) -> bool {
 **By Pane ID:**
 1. Parse `pane=ID` from args
 2. Look up pane in `pane_manifest` → get tab position
-3. Map tab position to tab_id using `leader_tabs`
+3. Map tab position to tab_id using `tabs` (from TabUpdate)
 4. Update `known_tabs[tab_id].status`
 5. Broadcast updated state to renderers
 

@@ -225,6 +225,9 @@ fn parse_default_name(name: &str) -> Option<u32> {
 
 impl State {
     fn start_election(&mut self) {
+        if self.election_pending {
+            return;
+        }
         self.election_pending = true;
         let payload = serde_json::json!({"plugin_id": self.plugin_id});
         eprintln!("[crew:{}:plugin{}] Starting election", self.instance_id, self.plugin_id);

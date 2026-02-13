@@ -650,8 +650,8 @@ impl ZellijPlugin for State {
             EventType::PermissionRequestResult,
         ]);
 
-        // Start leader election instead of relying on render-time detection
-        self.start_election();
+        // Election starts after permission grant (pipe_message_to_plugin
+        // requires MessageAndLaunchOtherPlugins permission)
     }
 
     fn update(&mut self, event: Event) -> bool {
@@ -666,6 +666,11 @@ impl ZellijPlugin for State {
                 self.mode_info = mode_info;
             }
             Event::TabUpdate(tabs) => {
+                // Fallback: if leader died and we never got a new PermissionRequestResult,
+                // trigger election on first TabUpdate we see as a leaderless renderer
+                if !self.is_leader && !self.election_pending && self.tabs.is_empty() {
+                    self.start_election();
+                }
                 // All instances: store tabs for rendering
                 if let Some(active_tab_index) = tabs.iter().position(|t| t.active) {
                     let active_tab_idx = active_tab_index + 1;
@@ -706,6 +711,7 @@ impl ZellijPlugin for State {
                 self.resign_leadership();
             }
             Event::PermissionRequestResult(PermissionStatus::Granted) => {
+                eprintln!("[crew:{}] PermissionRequestResult::Granted received", self.instance_id);
                 set_selectable(false);
                 subscribe(&[
                     EventType::TabUpdate,
@@ -714,6 +720,8 @@ impl ZellijPlugin for State {
                     EventType::Timer,
                     EventType::BeforeClose,
                 ]);
+                // Start election now that pipe messaging is available
+                self.start_election();
                 should_render = true;
             }
             Event::PermissionRequestResult(PermissionStatus::Denied) => {
@@ -848,6 +856,12 @@ impl ZellijPlugin for State {
         // ---- Internal crew-state broadcasts ----
 
         if !self.is_leader && pipe_message.name == "crew-state" {
+            // Receiving state from the leader proves a leader exists
+            if self.election_pending {
+                eprintln!("[crew:{}] Received crew-state during election, canceling (leader exists)",
+                    self.instance_id);
+                self.election_pending = false;
+            }
             if let Some(payload) = pipe_message.payload {
                 match serde_json::from_str::<Vec<CrewTabState>>(&payload) {
                     Ok(tabs) => {

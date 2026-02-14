@@ -476,6 +476,25 @@ impl State {
         self.broadcast_state();
     }
 
+    /// Resolve a terminal pane ID to the crew tab name that contains it.
+    fn resolve_pane_name(&self, pane_id: u32) -> Option<String> {
+        let manifest = self.pane_manifest.as_ref()?;
+        let tab_pos = manifest.panes.iter().find_map(|(pos, panes)| {
+            if panes.iter().any(|p| !p.is_plugin && p.id == pane_id) {
+                Some(*pos)
+            } else {
+                None
+            }
+        })?;
+        let tab = self.tabs.iter().find(|t| t.position == tab_pos)?;
+        let tab_id = parse_default_name(&tab.name).or_else(|| {
+            self.known_tabs.iter()
+                .find(|(_, ct)| ct.name == tab.name)
+                .map(|(id, _)| *id)
+        })?;
+        self.known_tabs.get(&tab_id).map(|ct| ct.name.clone())
+    }
+
     fn handle_external_status_update(&mut self, pipe_message: &PipeMessage) -> bool {
         // Try to parse as JSON first (for name-based routing)
         if let Some(payload) = &pipe_message.payload {
@@ -609,6 +628,83 @@ impl State {
             }
         } else {
             eprintln!("[crew:{}:leader] Pane {} not found in any tab", self.instance_id, pane_id);
+        }
+
+        false
+    }
+
+    fn handle_tell_message(&self, pipe_message: &PipeMessage) -> bool {
+        let dest = match pipe_message.args.get("to") {
+            Some(d) => d,
+            None => {
+                if let PipeSource::Cli(pipe_id) = &pipe_message.source {
+                    cli_pipe_output(pipe_id, "error: missing 'to' argument\n");
+                }
+                return false;
+            }
+        };
+
+        let message = match &pipe_message.payload {
+            Some(p) if !p.is_empty() => p.as_str(),
+            _ => {
+                if let PipeSource::Cli(pipe_id) = &pipe_message.source {
+                    cli_pipe_output(pipe_id, "error: missing message payload\n");
+                }
+                return false;
+            }
+        };
+
+        // Resolve sender name from pane ID
+        let sender = pipe_message.args.get("pane")
+            .and_then(|id_str| id_str.parse::<u32>().ok())
+            .and_then(|id| self.resolve_pane_name(id))
+            .unwrap_or_else(|| {
+                pipe_message.args.get("pane")
+                    .map(|id| format!("pane {}", id))
+                    .unwrap_or_else(|| "unknown".to_string())
+            });
+
+        // Find destination tab (case-insensitive)
+        let dest_tab = match self.known_tabs.values().find(|t| t.name.eq_ignore_ascii_case(dest)) {
+            Some(t) => t,
+            None => {
+                if let PipeSource::Cli(pipe_id) = &pipe_message.source {
+                    cli_pipe_output(pipe_id, &format!("error: tab '{}' not found\n", dest));
+                }
+                return false;
+            }
+        };
+
+        // Find a terminal pane in the destination tab
+        let dest_pane_id = match &self.pane_manifest {
+            Some(manifest) => {
+                manifest.panes.get(&dest_tab.position)
+                    .and_then(|panes| panes.iter().find(|p| !p.is_plugin))
+                    .map(|p| p.id)
+            }
+            None => {
+                if let PipeSource::Cli(pipe_id) = &pipe_message.source {
+                    cli_pipe_output(pipe_id, "error: pane manifest not available\n");
+                }
+                return false;
+            }
+        };
+
+        match dest_pane_id {
+            Some(pane_id) => {
+                let formatted = format!(
+                    "\n{} says, {}\n\nYou can reply with:  zellij-crew tell {} \"message\"\n",
+                    sender, message, sender
+                );
+                write_chars_to_pane_id(&formatted, PaneId::Terminal(pane_id));
+                eprintln!("[crew:{}:leader] Delivered message from '{}' to '{}' (pane {})",
+                    self.instance_id, sender, dest_tab.name, pane_id);
+            }
+            None => {
+                if let PipeSource::Cli(pipe_id) = &pipe_message.source {
+                    cli_pipe_output(pipe_id, &format!("error: no terminal pane found in tab '{}'\n", dest));
+                }
+            }
         }
 
         false
@@ -986,6 +1082,12 @@ Examples:
             }
 
             return self.handle_external_status_update(&pipe_message);
+        }
+
+        // ---- External zellij-crew:msg messages (leader only) ----
+
+        if self.is_leader && pipe_message.name == "zellij-crew:msg" {
+            return self.handle_tell_message(&pipe_message);
         }
 
         false

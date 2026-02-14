@@ -712,7 +712,7 @@ impl State {
                 // arrive as separate read() events on the receiving pty
                 write_to_pane_id(formatted.into_bytes(), PaneId::Terminal(pane_id));
                 self.pending_tell_enter = Some(pane_id);
-                set_timeout(0.05);
+                set_timeout(0.1);
                 if let PipeSource::Cli(pipe_id) = &pipe_message.source {
                     cli_pipe_output(pipe_id, &format!(
                         "Sent message to {} on pane {}\n", dest_tab.name, pane_id

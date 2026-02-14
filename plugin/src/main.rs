@@ -645,34 +645,24 @@ impl State {
         false
     }
 
-    fn find_zellij_log_dir() -> Option<std::path::PathBuf> {
-        for entry in std::fs::read_dir("/tmp").ok()?.flatten() {
-            if let Some(name) = entry.file_name().to_str() {
-                if name.starts_with("zellij-") {
-                    let log_dir = entry.path().join("zellij-log");
-                    if log_dir.is_dir() {
-                        return Some(log_dir);
-                    }
-                }
-            }
-        }
-        None
-    }
-
     fn log_tell_message(&self, msg_id: u32, sender: &str, dest: &str, pane_id: u32, message: &str) {
-        let log_path = match Self::find_zellij_log_dir() {
-            Some(dir) => dir.join("zellij-crew-messages.log"),
-            None => {
-                eprintln!("[crew:{}:leader] Cannot find zellij log dir in /tmp", self.instance_id);
-                return;
-            }
-        };
+        // WASI /tmp maps to /tmp/zellij-{uid} on host; zellij-log/ is already there
+        let log_path = "/tmp/zellij-log/zellij-crew-messages.log";
         let ts = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
-        let line = format!("{} msg#{} {} -> {} pane={} | {}\n", ts, msg_id, sender, dest, pane_id, message);
-        match OpenOptions::new().create(true).append(true).open(&log_path) {
+        let entry = serde_json::json!({
+            "ts": ts,
+            "id": msg_id,
+            "from": sender,
+            "to": dest,
+            "pane": pane_id,
+            "msg": message,
+        });
+        let mut line = entry.to_string();
+        line.push('\n');
+        match OpenOptions::new().create(true).append(true).open(log_path) {
             Ok(mut f) => { let _ = f.write_all(line.as_bytes()); }
             Err(e) => eprintln!("[crew:{}:leader] Failed to write message log: {}", self.instance_id, e),
         }

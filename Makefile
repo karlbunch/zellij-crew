@@ -18,6 +18,7 @@ install: build
 	@mkdir -p $(INSTALL_DIR)
 	cp $(WASM_BIN) $(INSTALL_DIR)/
 	cp $(CLI_BIN) $(INSTALL_DIR)/
+	chmod +x $(INSTALL_DIR)/zellij-crew-claude
 
 setup: install
 	$(INSTALL_DIR)/zellij-crew-claude --setup

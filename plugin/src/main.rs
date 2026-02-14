@@ -7,6 +7,8 @@ mod tab;
 use std::cmp::{max, min};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::convert::TryInto;
+use std::fs::OpenOptions;
+use std::io::Write as IoWrite;
 use std::time::SystemTime;
 
 use serde::{Deserialize, Serialize};
@@ -207,6 +209,7 @@ struct State {
     last_assigned_idx: Option<usize>,
     inherited_state: Option<HashMap<u32, CrewTabState>>,  // From leader resign
     pending_tell_enter: Option<u32>,  // Pane ID awaiting delayed \r after tell
+    next_msg_id: u32,                 // Monotonic counter for tell message IDs
 
     // All instances (for rendering)
     received_tabs: Vec<CrewTabState>,  // From leader broadcast (renderers only)
@@ -642,6 +645,18 @@ impl State {
         false
     }
 
+    fn log_tell_message(&self, msg_id: u32, sender: &str, dest: &str, pane_id: u32, message: &str) {
+        let ts = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let line = format!("{} msg#{} {} -> {} pane={} | {}\n", ts, msg_id, sender, dest, pane_id, message);
+        match OpenOptions::new().create(true).append(true).open("/tmp/zellij-crew-messages.log") {
+            Ok(mut f) => { let _ = f.write_all(line.as_bytes()); }
+            Err(e) => eprintln!("[crew:{}:leader] Failed to write message log: {}", self.instance_id, e),
+        }
+    }
+
     fn handle_tell_message(&mut self, pipe_message: &PipeMessage) -> bool {
         let dest = match pipe_message.args.get("to") {
             Some(d) => d,
@@ -673,9 +688,11 @@ impl State {
                     .unwrap_or_else(|| "unknown".to_string())
             });
 
-        // Find destination tab (case-insensitive)
-        let dest_tab = match self.known_tabs.values().find(|t| t.name.eq_ignore_ascii_case(dest)) {
-            Some(t) => t,
+        // Find destination tab (case-insensitive), extract values to release borrow
+        let (dest_name, dest_position) = match self.known_tabs.values()
+            .find(|t| t.name.eq_ignore_ascii_case(dest))
+        {
+            Some(t) => (t.name.clone(), t.position),
             None => {
                 if let PipeSource::Cli(pipe_id) = &pipe_message.source {
                     cli_pipe_output(pipe_id, &format!("error: tab '{}' not found\n", dest));
@@ -684,10 +701,14 @@ impl State {
             }
         };
 
+        // Assign message ID
+        self.next_msg_id += 1;
+        let msg_id = self.next_msg_id;
+
         // Find a terminal pane in the destination tab
         let dest_pane_id = match &self.pane_manifest {
             Some(manifest) => {
-                manifest.panes.get(&dest_tab.position)
+                manifest.panes.get(&dest_position)
                     .and_then(|panes| panes.iter().find(|p| !p.is_plugin))
                     .map(|p| p.id)
             }
@@ -703,23 +724,25 @@ impl State {
             Some(pane_id) => {
                 let append = self.config.tell_append
                     .replace("{from}", &sender)
-                    .replace("{to}", &dest_tab.name)
-                    .replace("{message}", message);
+                    .replace("{to}", &dest_name)
+                    .replace("{message}", message)
+                    .replace("{id}", &msg_id.to_string());
                 let formatted = format!(
-                    "\n[CREW MESSAGE from {sender}]: {message}\n{append}\n",
+                    "\n[CREW MESSAGE #{msg_id} from {sender}; to: {dest_name}] {message}\n{append}\n",
                 );
                 // Send message text now, delay Enter via timer so they
                 // arrive as separate read() events on the receiving pty
                 write_to_pane_id(formatted.into_bytes(), PaneId::Terminal(pane_id));
                 self.pending_tell_enter = Some(pane_id);
                 set_timeout(0.1);
+                self.log_tell_message(msg_id, &sender, &dest_name, pane_id, message);
                 if let PipeSource::Cli(pipe_id) = &pipe_message.source {
                     cli_pipe_output(pipe_id, &format!(
-                        "Sent message to {} on pane {}\n", dest_tab.name, pane_id
+                        "msg#{} sent to {} on pane {}\n", msg_id, dest_name, pane_id
                     ));
                 }
-                eprintln!("[crew:{}:leader] Delivered message from '{}' to '{}' (pane {})",
-                    self.instance_id, sender, dest_tab.name, pane_id);
+                eprintln!("[crew:{}:leader] Delivered msg#{} from '{}' to '{}' (pane {})",
+                    self.instance_id, msg_id, sender, dest_name, pane_id);
             }
             None => {
                 if let PipeSource::Cli(pipe_id) = &pipe_message.source {

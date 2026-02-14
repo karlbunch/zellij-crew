@@ -224,6 +224,18 @@ ID    Name    Status
 3     carol   🔔 attention
 ```
 
+### Detailed State (Agent Coordination)
+
+```bash
+# Via CLI
+zellij-crew state
+
+# Via pipe
+zellij pipe --name zellij-crew:status --args "format=json,state_query"
+```
+
+Returns JSON with per-tab pane metadata, message tracking timestamps, and status age -- designed for boss agents coordinating workers. See [PROTOCOL.md](PROTOCOL.md) for the full schema.
+
 ## Permissions
 
 The plugin requires these permissions:

@@ -38,6 +38,7 @@ fn print_help() {
     eprintln!("Usage:");
     eprintln!("  zellij-crew status <state>          Send status update to plugin");
     eprintln!("  zellij-crew tell <name> <message>   Send message to another tab");
+    eprintln!("  zellij-crew state                   Show detailed per-tab state (JSON)");
     eprintln!("  zellij-crew --setup                 Install hooks into ~/.claude/settings.json");
     eprintln!("  zellij-crew --remove                Remove hooks from ~/.claude/settings.json");
     eprintln!("  zellij-crew --help                  Show this help");
@@ -245,6 +246,15 @@ fn do_status(args: &[String]) {
     process::exit(1);
 }
 
+fn do_state() {
+    require_zellij();
+    let err = process::Command::new("zellij")
+        .args(["pipe", "--name", "zellij-crew:status", "--args", "format=json,state_query", "--", ""])
+        .exec();
+    eprintln!("zellij-crew: failed to exec zellij: {}", err);
+    process::exit(1);
+}
+
 fn do_tell(args: &[String]) {
     if args.len() < 2 {
         eprintln!("Usage: zellij-crew tell <name> <message...>");
@@ -280,6 +290,7 @@ fn main() {
         "--setup" => do_setup(),
         "--remove" => do_remove(),
         "status" => do_status(&args[1..]),
+        "state" => do_state(),
         "tell" => do_tell(&args[1..]),
         other => {
             eprintln!("zellij-crew: unknown command '{}'", other);

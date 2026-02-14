@@ -272,6 +272,73 @@ zellij pipe --name zellij-crew:status --args "format=json,list"
 
 Returns tab list via `cli_pipe_output()`.
 
+### State Command
+
+```bash
+# Via CLI
+zellij-crew state
+
+# Via pipe directly
+zellij pipe --name zellij-crew:status --args "format=json,state_query"
+```
+
+Returns detailed per-tab state as JSON, including pane metadata and message tracking timestamps. Designed for boss agents coordinating multiple worker agents.
+
+**JSON Schema:**
+
+```json
+[
+  {
+    "id": 1,
+    "pos": 0,
+    "name": "Alice",
+    "status": "working",
+    "status_updated_at": 1771106100,
+    "last_msg_to": {"id": 5, "ts": 1771106232},
+    "last_msg_from": {"id": 8, "ts": 1771106290},
+    "pane": {
+      "id": 3,
+      "title": "/home/karl/workspace-wsl/zellij-crew",
+      "is_focused": true,
+      "exited": false,
+      "exit_status": null,
+      "rows": 40,
+      "cols": 120
+    }
+  }
+]
+```
+
+**Fields:**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `id` | u32 | Stable tab ID |
+| `pos` | usize | Current tab position (0-indexed) |
+| `name` | String | Crew-assigned tab name |
+| `status` | String | Activity status (unknown/idle/working/question/sleeping/watching/attention) |
+| `status_updated_at` | u64 or null | Epoch seconds when status last changed |
+| `last_msg_to` | object or null | Last message sent TO this tab: `{"id": msg_id, "ts": epoch_secs}` |
+| `last_msg_from` | object or null | Last message sent FROM this tab: `{"id": msg_id, "ts": epoch_secs}` |
+| `pane` | object or null | Terminal pane info (null if PaneManifest not available) |
+
+**Pane fields:**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `id` | u32 | Pane ID |
+| `title` | String | Terminal title (usually cwd or running command) |
+| `is_focused` | bool | Whether pane has keyboard focus |
+| `exited` | bool | Whether the pane's process has exited |
+| `exit_status` | i32 or null | Exit code if exited |
+| `rows` | usize | Content rows |
+| `cols` | usize | Content columns |
+
+**Notes:**
+- Message tracking fields (`last_msg_to`, `last_msg_from`, `status_updated_at`) are leader-only runtime state, not persisted across leader elections.
+- The `pane` field is null if PaneManifest hasn't been received yet (typically only on startup).
+- Only the first non-plugin pane per tab is included.
+
 ## Valid States
 
 | State | Case-sensitive | Default Indicator |

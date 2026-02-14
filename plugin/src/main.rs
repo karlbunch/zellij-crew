@@ -175,6 +175,18 @@ impl ActivityStatus {
             Self::Attention => "🔔",
         }
     }
+
+    fn status_str(&self) -> &'static str {
+        match self {
+            Self::Unknown => "unknown",
+            Self::Idle => "idle",
+            Self::Working => "working",
+            Self::Question => "question",
+            Self::Sleeping => "sleeping",
+            Self::Watching => "watching",
+            Self::Attention => "attention",
+        }
+    }
 }
 
 impl Default for ActivityStatus {
@@ -199,6 +211,13 @@ struct CrewTabState {
 
     user_defined: bool,              // true if user named it, false if from our pool
     status: ActivityStatus,          // Current activity status
+
+    #[serde(skip)]
+    last_msg_to: Option<(u32, u64)>,       // (msg_id, epoch_secs) - last message sent TO this tab
+    #[serde(skip)]
+    last_msg_from: Option<(u32, u64)>,     // (msg_id, epoch_secs) - last message FROM this tab
+    #[serde(skip)]
+    status_updated_at: Option<u64>,        // epoch_secs when status last changed
 }
 
 #[derive(Default)]
@@ -229,6 +248,13 @@ struct State {
 // ============================================================================
 // Helper Functions
 // ============================================================================
+
+fn epoch_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
 
 fn parse_default_name(name: &str) -> Option<u32> {
     // "Tab #5" → Some(5) (tab_id for rename_tab)
@@ -449,6 +475,9 @@ impl State {
                             pending_rename: Some(new_name),
                             user_defined: false,
                             status: ActivityStatus::Unknown,
+                            last_msg_to: None,
+                            last_msg_from: None,
+                            status_updated_at: None,
                         },
                     );
                     seen_tab_ids.insert(tab_id);
@@ -468,6 +497,9 @@ impl State {
                         pending_rename: None,
                         user_defined: true,
                         status: ActivityStatus::Unknown,
+                        last_msg_to: None,
+                        last_msg_from: None,
+                        status_updated_at: None,
                     },
                 );
                 seen_tab_ids.insert(tab_id);
@@ -567,6 +599,7 @@ impl State {
             if crew_tab.status != new_status {
                 eprintln!("[crew:{}:leader] Updating tab '{}' to status: {:?}", self.instance_id, name, new_status);
                 crew_tab.status = new_status;
+                crew_tab.status_updated_at = Some(epoch_secs());
                 self.broadcast_state();
                 return true;
             }
@@ -639,6 +672,7 @@ impl State {
                         eprintln!("[crew:{}:leader] Updating tab '{}' (id={}) to status: {:?}",
                             self.instance_id, crew_tab.name, tab_id, new_status);
                         crew_tab.status = new_status;
+                        crew_tab.status_updated_at = Some(epoch_secs());
                         self.broadcast_state();
                         return true;
                     }
@@ -762,6 +796,19 @@ impl State {
                 }
                 eprintln!("[crew:{}:leader] Delivered msg#{} from '{}' to '{}' (pane {})",
                     self.instance_id, msg_id, sender, dest_name, pane_id);
+
+                // Track message timestamps for state query
+                let now = epoch_secs();
+                if let Some(dest_tab) = self.known_tabs.values_mut()
+                    .find(|t| t.name == dest_name)
+                {
+                    dest_tab.last_msg_to = Some((msg_id, now));
+                }
+                if let Some(sender_tab) = self.known_tabs.values_mut()
+                    .find(|t| t.name == sender)
+                {
+                    sender_tab.last_msg_from = Some((msg_id, now));
+                }
             }
             None => {
                 if let PipeSource::Cli(pipe_id) = &pipe_message.source {
@@ -1073,9 +1120,10 @@ Config (in plugin KDL):
   (set any status_* to "" to suppress the [brackets] entirely)
 
 Commands:
-  --args help              Show this help
-  --args list              List all tabs (alias: ls)
-  --args format=json,list  Output in JSON format
+  --args help               Show this help
+  --args list               List all tabs (alias: ls)
+  --args format=json,list   Output in JSON format
+  --args format=json,state  Detailed per-tab state (pane info, msg tracking)
 
 Examples:
   zellij pipe --name zellij-crew:status --args "pane=$ZELLIJ_PANE_ID,state=working"
@@ -1143,6 +1191,67 @@ Examples:
                         out
                     };
 
+                    cli_pipe_output(pipe_id, &output);
+                }
+                return false;
+            }
+
+            // State command - detailed per-tab state for agent coordination
+            // Triggered by: --args "format=json,state" (with no pane/name keys)
+            // or explicitly: --args "state_query" (used by CLI)
+            let is_state = pipe_message.args.contains_key("state_query")
+                || (pipe_message.args.get("format").map(|s| s.as_str()) == Some("json")
+                    && pipe_message.args.contains_key("state")
+                    && !pipe_message.args.contains_key("pane")
+                    && !pipe_message.args.contains_key("name"));
+
+            if is_state {
+                if let PipeSource::Cli(pipe_id) = &pipe_message.source {
+                    let mut tabs: Vec<_> = self.known_tabs.values().collect();
+                    tabs.sort_by_key(|t| t.position);
+
+                    let json_tabs: Vec<_> = tabs.iter().map(|tab| {
+                        let status_str = tab.status.status_str();
+
+                        let msg_to = tab.last_msg_to.map(|(id, ts)| {
+                            serde_json::json!({"id": id, "ts": ts})
+                        });
+                        let msg_from = tab.last_msg_from.map(|(id, ts)| {
+                            serde_json::json!({"id": id, "ts": ts})
+                        });
+
+                        // Find terminal pane info for this tab
+                        let pane_info = self.pane_manifest.as_ref().and_then(|manifest| {
+                            manifest.panes.get(&tab.position).and_then(|panes| {
+                                panes.iter().find(|p| !p.is_plugin).map(|p| {
+                                    serde_json::json!({
+                                        "id": p.id,
+                                        "title": p.title,
+                                        "is_focused": p.is_focused,
+                                        "exited": p.exited,
+                                        "exit_status": p.exit_status,
+                                        "rows": p.pane_content_rows,
+                                        "cols": p.pane_content_columns,
+                                    })
+                                })
+                            })
+                        });
+
+                        serde_json::json!({
+                            "id": tab.tab_id,
+                            "pos": tab.position,
+                            "name": tab.name,
+                            "status": status_str,
+                            "status_updated_at": tab.status_updated_at,
+                            "last_msg_to": msg_to,
+                            "last_msg_from": msg_from,
+                            "pane": pane_info,
+                        })
+                    }).collect();
+
+                    let output = format!("{}\n",
+                        serde_json::to_string_pretty(&json_tabs)
+                            .unwrap_or_else(|_| "[]".to_string()));
                     cli_pipe_output(pipe_id, &output);
                 }
                 return false;

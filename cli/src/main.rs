@@ -16,12 +16,16 @@ struct HookMapping {
 }
 
 const HOOK_MAPPINGS: &[HookMapping] = &[
-    HookMapping { event: "SessionStart",       state: "watching", matcher: None },
-    HookMapping { event: "UserPromptSubmit",    state: "working",  matcher: None },
-    HookMapping { event: "PreToolUse",          state: "working",  matcher: Some("*") },
-    HookMapping { event: "Stop",                state: "idle",     matcher: None },
-    HookMapping { event: "PermissionRequest",   state: "question", matcher: Some("*") },
-    HookMapping { event: "SessionEnd",          state: "unknown",  matcher: None },
+    HookMapping { event: "SessionStart",       state: "watching",  matcher: None },
+    HookMapping { event: "UserPromptSubmit",    state: "working",   matcher: None },
+    HookMapping { event: "PreToolUse",          state: "working",   matcher: Some("*") },
+    HookMapping { event: "PostToolUse",         state: "working",   matcher: Some("*") },
+    HookMapping { event: "SubagentStart",       state: "working",   matcher: Some("*") },
+    HookMapping { event: "SubagentStop",        state: "working",   matcher: Some("*") },
+    HookMapping { event: "Stop",                state: "idle",      matcher: None },
+    HookMapping { event: "Notification",        state: "attention",  matcher: Some("*") },
+    HookMapping { event: "PermissionRequest",   state: "question",  matcher: Some("*") },
+    HookMapping { event: "SessionEnd",          state: "unknown",   matcher: None },
 ];
 
 fn cli_path() -> String {

@@ -1,0 +1,14 @@
+[package]
+name = "zellij-crew-claude"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "CLI companion for zellij-crew: sends status updates and manages Claude Code hooks"
+
+[[bin]]
+name = "zellij-crew-claude"
+path = "src/main.rs"
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"

@@ -1,2 +1,3 @@
-[build]
-target = "wasm32-wasip1"
+# Default target removed - workspace has both wasm and native crates.
+# Use `cargo build --target wasm32-wasip1 -p zellij-crew` for the plugin.
+# Use `cargo build -p zellij-crew-claude` for the CLI.

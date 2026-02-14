@@ -697,6 +697,11 @@ impl State {
                     sender, message, sender
                 );
                 write_chars_to_pane_id(&formatted, PaneId::Terminal(pane_id));
+                if let PipeSource::Cli(pipe_id) = &pipe_message.source {
+                    cli_pipe_output(pipe_id, &format!(
+                        "Sent message to {} on pane {}\n", dest_tab.name, pane_id
+                    ));
+                }
                 eprintln!("[crew:{}:leader] Delivered message from '{}' to '{}' (pane {})",
                     self.instance_id, sender, dest_tab.name, pane_id);
             }
@@ -738,6 +743,7 @@ impl ZellijPlugin for State {
             PermissionType::ChangeApplicationState,
             PermissionType::MessageAndLaunchOtherPlugins,
             PermissionType::ReadCliPipes,
+            PermissionType::WriteToStdin,
         ]);
         subscribe(&[
             EventType::TabUpdate,

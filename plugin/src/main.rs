@@ -72,6 +72,8 @@ struct Config {
     /// Per-status indicator overrides. Key present with empty string = suppress brackets entirely.
     /// Key absent = use default emoji.
     status_indicators: HashMap<ActivityStatus, String>,
+    /// Appended to tell messages. Substitutions: {from}, {to}, {message}.
+    tell_append: String,
 }
 
 impl Config {
@@ -112,11 +114,17 @@ impl Config {
             }
         }
 
+        let tell_append = config
+            .get("tell_append")
+            .cloned()
+            .unwrap_or_else(|| "*CRITICAL* Reply ONLY by running this bash command, do not just output your response: zellij-crew tell {from} \"your reply here\"".to_string());
+
         Config {
             names,
             mode,
             hide_swap_layout_indication,
             status_indicators,
+            tell_append,
         }
     }
 
@@ -198,6 +206,7 @@ struct State {
     pane_manifest: Option<PaneManifest>,     // For mapping pane_id -> tab
     last_assigned_idx: Option<usize>,
     inherited_state: Option<HashMap<u32, CrewTabState>>,  // From leader resign
+    pending_tell_enter: Option<u32>,  // Pane ID awaiting delayed \r after tell
 
     // All instances (for rendering)
     received_tabs: Vec<CrewTabState>,  // From leader broadcast (renderers only)
@@ -633,7 +642,7 @@ impl State {
         false
     }
 
-    fn handle_tell_message(&self, pipe_message: &PipeMessage) -> bool {
+    fn handle_tell_message(&mut self, pipe_message: &PipeMessage) -> bool {
         let dest = match pipe_message.args.get("to") {
             Some(d) => d,
             None => {
@@ -692,11 +701,18 @@ impl State {
 
         match dest_pane_id {
             Some(pane_id) => {
+                let append = self.config.tell_append
+                    .replace("{from}", &sender)
+                    .replace("{to}", &dest_tab.name)
+                    .replace("{message}", message);
                 let formatted = format!(
-                    "\n{} says, {}\n\nYou can reply with:  zellij-crew tell {} \"message\"\n",
-                    sender, message, sender
+                    "\n[CREW MESSAGE from {sender}]: {message}\n{append}\n",
                 );
-                write_chars_to_pane_id(&formatted, PaneId::Terminal(pane_id));
+                // Send message text now, delay Enter via timer so they
+                // arrive as separate read() events on the receiving pty
+                write_to_pane_id(formatted.into_bytes(), PaneId::Terminal(pane_id));
+                self.pending_tell_enter = Some(pane_id);
+                set_timeout(0.05);
                 if let PipeSource::Cli(pipe_id) = &pipe_message.source {
                     cli_pipe_output(pipe_id, &format!(
                         "Sent message to {} on pane {}\n", dest_tab.name, pane_id
@@ -801,6 +817,9 @@ impl ZellijPlugin for State {
                 should_render = false;
             }
             Event::Timer(_) => {
+                if let Some(pane_id) = self.pending_tell_enter.take() {
+                    write_to_pane_id(vec![b'\r'], PaneId::Terminal(pane_id));
+                }
                 if self.election_pending {
                     // No ack received within timeout, claim leadership
                     self.become_leader();

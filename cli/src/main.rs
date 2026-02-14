@@ -260,7 +260,7 @@ fn do_tell(args: &[String]) {
         .args([
             "pipe", "--name", "zellij-crew:msg",
             "--args", &pipe_args,
-            "--payload", &message,
+            "--", &message,
         ])
         .exec();
     eprintln!("zellij-crew: failed to exec zellij: {}", err);

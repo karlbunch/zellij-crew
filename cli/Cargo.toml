@@ -1,12 +1,12 @@
 [package]
-name = "zellij-crew-claude"
+name = "zellij-crew-cli"
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
 description = "CLI companion for zellij-crew: sends status updates and manages Claude Code hooks"
 
 [[bin]]
-name = "zellij-crew-claude"
+name = "zellij-crew"
 path = "src/main.rs"
 
 [dependencies]

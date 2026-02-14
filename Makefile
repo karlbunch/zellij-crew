@@ -15,10 +15,11 @@ build-cli:
 	cargo build --release -p zellij-crew-claude
 
 install: build
-	@mkdir -p $(INSTALL_DIR)
+	@mkdir -p $(INSTALL_DIR) $(HOME)/.local/bin
 	cp $(WASM_BIN) $(INSTALL_DIR)/
 	cp $(CLI_BIN) $(INSTALL_DIR)/
 	chmod +x $(INSTALL_DIR)/zellij-crew-claude
+	ln -sf $(INSTALL_DIR)/zellij-crew-claude $(HOME)/.local/bin/zellij-crew-claude
 
 setup: install
 	$(INSTALL_DIR)/zellij-crew-claude --setup

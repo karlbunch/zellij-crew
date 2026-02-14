@@ -74,8 +74,10 @@ struct Config {
     /// Per-status indicator overrides. Key present with empty string = suppress brackets entirely.
     /// Key absent = use default emoji.
     status_indicators: HashMap<ActivityStatus, String>,
-    /// Appended to tell messages. Substitutions: {from}, {to}, {message}.
+    /// Appended to tell messages. Substitutions: {from}, {to}, {message}, {id}.
     tell_append: String,
+    /// Delay in ms between message text and Enter keystroke.
+    tell_delay_ms: u32,
 }
 
 impl Config {
@@ -121,12 +123,18 @@ impl Config {
             .cloned()
             .unwrap_or_else(|| "*CRITICAL* Reply ONLY by running this bash command, do not just output your response: zellij-crew tell {from} \"your reply here\"".to_string());
 
+        let tell_delay_ms = config
+            .get("tell_delay_ms")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(250);
+
         Config {
             names,
             mode,
             hide_swap_layout_indication,
             status_indicators,
             tell_append,
+            tell_delay_ms,
         }
     }
 
@@ -745,7 +753,7 @@ impl State {
                 // arrive as separate read() events on the receiving pty
                 write_to_pane_id(formatted.into_bytes(), PaneId::Terminal(pane_id));
                 self.pending_tell_enter = Some(pane_id);
-                set_timeout(0.1);
+                set_timeout(self.config.tell_delay_ms as f64 / 1000.0);
                 self.log_tell_message(msg_id, &sender, &dest_name, pane_id, message);
                 if let PipeSource::Cli(pipe_id) = &pipe_message.source {
                     cli_pipe_output(pipe_id, &format!(

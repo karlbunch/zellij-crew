@@ -23,23 +23,24 @@ const HOOK_MAPPINGS: &[HookMapping] = &[
     HookMapping { event: "SubagentStart",       state: "working",   matcher: Some("*") },
     HookMapping { event: "SubagentStop",        state: "working",   matcher: Some("*") },
     HookMapping { event: "Stop",                state: "idle",      matcher: None },
-    HookMapping { event: "Notification",        state: "attention",  matcher: Some("*") },
+    HookMapping { event: "Notification",        state: "attention", matcher: Some("*") },
     HookMapping { event: "PermissionRequest",   state: "question",  matcher: Some("*") },
     HookMapping { event: "SessionEnd",          state: "unknown",   matcher: None },
 ];
 
 fn cli_path() -> String {
-    format!("\"$HOME/.config/zellij/zellij-crew-claude\"")
+    "\"$HOME/.config/zellij/zellij-crew-claude\"".to_string()
 }
 
 fn print_help() {
-    eprintln!("zellij-crew-claude - Claude Code hook companion for zellij-crew");
+    eprintln!("zellij-crew-claude - Claude Code companion for zellij-crew");
     eprintln!();
     eprintln!("Usage:");
-    eprintln!("  zellij-crew-claude <state>     Send status update to zellij-crew plugin");
-    eprintln!("  zellij-crew-claude --setup     Install hooks into ~/.claude/settings.json");
-    eprintln!("  zellij-crew-claude --remove    Remove hooks from ~/.claude/settings.json");
-    eprintln!("  zellij-crew-claude --help      Show this help");
+    eprintln!("  zellij-crew-claude status <state>          Send status update to plugin");
+    eprintln!("  zellij-crew-claude tell <name> <message>   Send message to another tab");
+    eprintln!("  zellij-crew-claude --setup                 Install hooks into ~/.claude/settings.json");
+    eprintln!("  zellij-crew-claude --remove                Remove hooks from ~/.claude/settings.json");
+    eprintln!("  zellij-crew-claude --help                  Show this help");
     eprintln!();
     eprintln!("Valid states:");
     for s in VALID_STATES {
@@ -52,6 +53,10 @@ fn print_help() {
         eprintln!("  {:25} -> {:10} (matcher: {})", h.event, h.state, m);
     }
 }
+
+// ============================================================================
+// Settings management (--setup / --remove)
+// ============================================================================
 
 fn settings_path() -> PathBuf {
     let home = env::var("HOME").unwrap_or_else(|_| {
@@ -93,7 +98,6 @@ fn write_settings(path: &PathBuf, value: &Value) {
 }
 
 fn has_our_hook(entry: &Value) -> bool {
-    // Check if any hook command in this group references zellij-crew-claude
     if let Some(hooks) = entry.get("hooks").and_then(|h| h.as_array()) {
         for hook in hooks {
             if let Some(cmd) = hook.get("command").and_then(|c| c.as_str()) {
@@ -107,7 +111,7 @@ fn has_our_hook(entry: &Value) -> bool {
 }
 
 fn make_hook_entry(mapping: &HookMapping) -> Value {
-    let command = format!("{} {}", cli_path(), mapping.state);
+    let command = format!("{} status {}", cli_path(), mapping.state);
     let mut entry = serde_json::Map::new();
     if let Some(m) = mapping.matcher {
         entry.insert("matcher".to_string(), Value::String(m.to_string()));
@@ -125,7 +129,6 @@ fn do_setup() {
     let mut installed = 0u32;
     let mut skipped = 0u32;
 
-    // Ensure .hooks exists as an object
     if settings.get("hooks").is_none() {
         settings
             .as_object_mut()
@@ -151,7 +154,6 @@ fn do_setup() {
             process::exit(1);
         });
 
-        // Check if we already have a hook for this state
         let already = arr.iter().any(|e| has_our_hook(e));
         if already {
             skipped += 1;
@@ -164,9 +166,7 @@ fn do_setup() {
     write_settings(&path, &settings);
     eprintln!(
         "zellij-crew-claude: installed {} hooks, {} already present ({})",
-        installed,
-        skipped,
-        path.display()
+        installed, skipped, path.display()
     );
 }
 
@@ -189,7 +189,6 @@ fn do_remove() {
                 removed += (before - arr.len()) as u32;
             }
         }
-        // Remove empty event arrays
         let empty_events: Vec<String> = hooks
             .iter()
             .filter(|(_, v)| v.as_array().is_some_and(|a| a.is_empty()))
@@ -203,20 +202,33 @@ fn do_remove() {
     write_settings(&path, &settings);
     eprintln!(
         "zellij-crew-claude: removed {} hooks ({})",
-        removed,
-        path.display()
+        removed, path.display()
     );
 }
 
-fn do_send_state(state: &str) {
-    // Exit silently if not in zellij
+// ============================================================================
+// Subcommands
+// ============================================================================
+
+fn require_zellij() -> String {
     if env::var("ZELLIJ").is_err() {
         process::exit(0);
     }
-    let pane_id = match env::var("ZELLIJ_PANE_ID") {
+    match env::var("ZELLIJ_PANE_ID") {
         Ok(id) => id,
         Err(_) => process::exit(0),
-    };
+    }
+}
+
+fn do_status(args: &[String]) {
+    if args.is_empty() {
+        eprintln!("Usage: zellij-crew-claude status <state>");
+        eprintln!("Valid states: {}", VALID_STATES.join(" "));
+        process::exit(1);
+    }
+
+    let pane_id = require_zellij();
+    let state = args[0].as_str();
 
     if !VALID_STATES.contains(&state) {
         eprintln!("zellij-crew-claude: invalid state '{}'", state);
@@ -224,11 +236,32 @@ fn do_send_state(state: &str) {
         process::exit(1);
     }
 
-    let args = format!("pane={},state={}", pane_id, state);
+    let pipe_args = format!("pane={},state={}", pane_id, state);
     let err = process::Command::new("zellij")
-        .args(["pipe", "--name", "zellij-crew:status", "--args", &args])
+        .args(["pipe", "--name", "zellij-crew:status", "--args", &pipe_args])
         .exec();
-    // exec() only returns on error
+    eprintln!("zellij-crew-claude: failed to exec zellij: {}", err);
+    process::exit(1);
+}
+
+fn do_tell(args: &[String]) {
+    if args.len() < 2 {
+        eprintln!("Usage: zellij-crew-claude tell <name> <message...>");
+        process::exit(1);
+    }
+
+    let pane_id = require_zellij();
+    let dest = &args[0];
+    let message = args[1..].join(" ");
+
+    let pipe_args = format!("to={},pane={}", dest, pane_id);
+    let err = process::Command::new("zellij")
+        .args([
+            "pipe", "--name", "zellij-crew:msg",
+            "--args", &pipe_args,
+            "--payload", &message,
+        ])
+        .exec();
     eprintln!("zellij-crew-claude: failed to exec zellij: {}", err);
     process::exit(1);
 }
@@ -245,6 +278,12 @@ fn main() {
         "--help" | "-h" => print_help(),
         "--setup" => do_setup(),
         "--remove" => do_remove(),
-        state => do_send_state(state),
+        "status" => do_status(&args[1..]),
+        "tell" => do_tell(&args[1..]),
+        other => {
+            eprintln!("zellij-crew-claude: unknown command '{}'", other);
+            eprintln!("Run with --help for usage");
+            process::exit(1);
+        }
     }
 }

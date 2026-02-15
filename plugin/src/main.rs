@@ -197,12 +197,12 @@ impl Default for ActivityStatus {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct CrewTabState {
-    tab_id: u32,                     // Stable ID from "Tab #N" (redundant with HashMap key but explicit)
+    tab_id: usize,                   // Stable ID from TabInfo.tab_id (survives reordering)
     position: usize,                 // Current position (updates when tabs reorder)
     name: String,                    // Current name ("Alice" after rename, "Tab #5" before)
 
     // ADR: Why pending_rename flag?
-    // Prevents infinite rename loops: when we call rename_tab(), the next TabUpdate
+    // Prevents infinite rename loops: when we call rename_tab_with_id(), the next TabUpdate
     // may still show the old name (rename not processed yet). We track pending renames
     // to avoid re-renaming the same tab. Once TabUpdate shows the new name, we confirm
     // by matching against pending_rename and clearing the flag.
@@ -231,10 +231,10 @@ struct State {
     election_pending: bool,   // Waiting for election timeout
 
     // Leader-only state
-    known_tabs: HashMap<u32, CrewTabState>,  // tab_id -> CrewTabState
-    pane_manifest: Option<PaneManifest>,     // For mapping pane_id -> tab
+    known_tabs: HashMap<usize, CrewTabState>,  // tab_id -> CrewTabState
+    pane_manifest: Option<PaneManifest>,       // For mapping pane_id -> tab
     last_assigned_idx: Option<usize>,
-    inherited_state: Option<HashMap<u32, CrewTabState>>,  // From leader resign
+    inherited_state: Option<HashMap<usize, CrewTabState>>,  // From leader resign
     pending_tell_enter: Option<u32>,  // Pane ID awaiting delayed \r after tell
     next_msg_id: u32,                 // Monotonic counter for tell message IDs
 
@@ -256,13 +256,20 @@ fn epoch_secs() -> u64 {
         .as_secs()
 }
 
-fn parse_default_name(name: &str) -> Option<u32> {
-    // "Tab #5" → Some(5) (tab_id for rename_tab)
-    if name.starts_with("Tab #") {
-        name[5..].parse().ok()
-    } else {
-        None
+/// Rename a tab by its stable tab_id (not position).
+/// Mirrors the shim pattern from zellij-tile but uses RenameTabWithId instead of RenameTab.
+fn rename_tab_with_id(tab_id: usize, name: String) {
+    use plugin_api::plugin_command::ProtobufPluginCommand;
+
+    #[link(wasm_import_module = "zellij")]
+    extern "C" {
+        fn host_run_plugin_command();
     }
+
+    let plugin_command = PluginCommand::RenameTabWithId(tab_id as u64, name);
+    let protobuf_plugin_command: ProtobufPluginCommand = plugin_command.try_into().unwrap();
+    object_to_stdout(&protobuf_plugin_command.encode_to_vec());
+    unsafe { host_run_plugin_command() };
 }
 
 // ============================================================================
@@ -279,7 +286,6 @@ impl State {
         eprintln!("[crew:{}:plugin{}] Starting election", self.instance_id, self.plugin_id);
         pipe_message_to_plugin(
             MessageToPlugin::new(MSG_LEADER_PING)
-                .with_plugin_url("crew")
                 .with_payload(serde_json::to_string(&payload).unwrap_or_default()),
         );
         set_timeout(ELECTION_TIMEOUT_SECS);
@@ -300,7 +306,6 @@ impl State {
         let payload = serde_json::json!({"plugin_id": self.plugin_id});
         pipe_message_to_plugin(
             MessageToPlugin::new(MSG_LEADER_CLAIM)
-                .with_plugin_url("crew")
                 .with_payload(serde_json::to_string(&payload).unwrap_or_default()),
         );
 
@@ -320,7 +325,6 @@ impl State {
         });
         pipe_message_to_plugin(
             MessageToPlugin::new(MSG_LEADER_RESIGN)
-                .with_plugin_url("crew")
                 .with_payload(serde_json::to_string(&payload).unwrap_or_default()),
         );
 
@@ -345,7 +349,6 @@ impl State {
 
             pipe_message_to_plugin(
                 MessageToPlugin::new("crew-state")
-                    .with_plugin_url("crew")
                     .with_payload(json),
             );
         } else {
@@ -397,78 +400,44 @@ impl State {
         // Track which tab IDs we've seen in this update
         let mut seen_tab_ids = HashSet::new();
 
-        // PASS 1: Match existing tabs by name (handles renames) and position (handles moves)
         for tab in tabs {
-            let mut matched = false;
+            let tab_id = tab.tab_id;
+            seen_tab_ids.insert(tab_id);
 
-            // Try to match by name first
-            for (tab_id, crew_tab) in self.known_tabs.iter_mut() {
+            if let Some(crew_tab) = self.known_tabs.get_mut(&tab_id) {
+                // Existing tab - check for pending rename confirmation or user rename
                 if let Some(pending) = &crew_tab.pending_rename {
                     if pending == &tab.name {
-                        // Pending rename confirmed
-                        eprintln!("[crew:{}:leader] Rename confirmed: Tab #{} -> {} (pos {})", self.instance_id, tab_id, tab.name, tab.position);
+                        eprintln!("[crew:{}:leader] Rename confirmed: tab {} -> {} (pos {})",
+                            self.instance_id, tab_id, tab.name, tab.position);
                         crew_tab.name = tab.name.clone();
                         crew_tab.position = tab.position;
                         crew_tab.pending_rename = None;
-                        seen_tab_ids.insert(*tab_id);
-                        matched = true;
-                        break;
                     }
-                } else if crew_tab.name == tab.name {
-                    // Name match - update position if changed
-                    if crew_tab.position != tab.position {
-                        eprintln!("[crew:{}:leader] Tab #{} '{}' moved from position {} to {}",
-                            self.instance_id, tab_id, tab.name, crew_tab.position, tab.position);
-                        crew_tab.position = tab.position;
-                    }
-                    seen_tab_ids.insert(*tab_id);
-                    matched = true;
-                    break;
-                }
-            }
-
-            if matched {
-                continue;
-            }
-
-            // Try to match by position (catches user renames of existing tabs)
-            for (tab_id, crew_tab) in self.known_tabs.iter_mut() {
-                if crew_tab.position == tab.position && crew_tab.pending_rename.is_none() {
-                    // Same position, different name - user renamed it
-                    eprintln!("[crew:{}:leader] Tab #{} at position {} renamed: '{}' -> '{}' (user-defined)",
-                        self.instance_id, tab_id, tab.position, crew_tab.name, tab.name);
+                    // else: rename not yet reflected, keep waiting
+                } else if crew_tab.name != tab.name {
+                    // Name changed without pending rename - user renamed it
+                    eprintln!("[crew:{}:leader] Tab {} renamed by user: '{}' -> '{}' (pos {})",
+                        self.instance_id, tab_id, crew_tab.name, tab.name, tab.position);
                     crew_tab.name = tab.name.clone();
                     crew_tab.user_defined = true;
-                    seen_tab_ids.insert(*tab_id);
-                    matched = true;
-                    break;
+                    crew_tab.position = tab.position;
                 }
-            }
-
-            if matched {
-                continue;
-            }
-
-            // No match by name or position - this is a new tab
-            // Try to extract tab_id from default name, or infer it
-            let tab_id = if let Some(id) = parse_default_name(&tab.name) {
-                id
+                if crew_tab.position != tab.position {
+                    eprintln!("[crew:{}:leader] Tab {} '{}' moved pos {} -> {}",
+                        self.instance_id, tab_id, crew_tab.name, crew_tab.position, tab.position);
+                    crew_tab.position = tab.position;
+                }
             } else {
-                // User-defined name on new tab - infer tab_id from missing IDs
-                // Find the lowest tab_id not in known_tabs
-                let used_ids: HashSet<u32> = self.known_tabs.keys().cloned().collect();
-                (1..=100).find(|id| !used_ids.contains(id)).unwrap_or(tab.position as u32)
-            };
+                // New tab
+                if tab.name.starts_with("Tab #") {
+                    // Default name - allocate from pool and rename
+                    if let Some(new_name) = self.allocate_from_pool() {
+                        eprintln!("[crew:{}:leader] New tab {}: renaming '{}' -> {} (pos {})",
+                            self.instance_id, tab_id, tab.name, new_name, tab.position);
+                        rename_tab_with_id(tab_id, new_name.clone());
 
-            if parse_default_name(&tab.name).is_some() && !self.known_tabs.contains_key(&tab_id) {
-                // New tab with default name - allocate a name from pool
-                if let Some(new_name) = self.allocate_from_pool() {
-                    eprintln!("[crew:{}:leader] New tab: renaming Tab #{} -> {} (pos {})", self.instance_id, tab_id, new_name, tab.position);
-                    rename_tab(tab_id, new_name.clone());
-
-                    self.known_tabs.insert(
-                        tab_id,
-                        CrewTabState {
+                        self.known_tabs.insert(tab_id, CrewTabState {
                             tab_id,
                             position: tab.position,
                             name: tab.name.clone(),
@@ -478,19 +447,15 @@ impl State {
                             last_msg_to: None,
                             last_msg_from: None,
                             status_updated_at: None,
-                        },
-                    );
-                    seen_tab_ids.insert(tab_id);
+                        });
+                    } else {
+                        eprintln!("[crew:{}:leader] Pool exhausted, leaving tab {} unnamed", self.instance_id, tab_id);
+                    }
                 } else {
-                    eprintln!("[crew:{}:leader] Pool exhausted, leaving Tab #{} unnamed", self.instance_id, tab_id);
-                }
-            } else if !seen_tab_ids.contains(&tab_id) {
-                // New tab with user-defined name - track it
-                eprintln!("[crew:{}:leader] New tab with user-defined name: Tab #{} '{}' (pos {})",
-                    self.instance_id, tab_id, tab.name, tab.position);
-                self.known_tabs.insert(
-                    tab_id,
-                    CrewTabState {
+                    // User-defined name on a new tab - track it
+                    eprintln!("[crew:{}:leader] New tab {} with user name '{}' (pos {})",
+                        self.instance_id, tab_id, tab.name, tab.position);
+                    self.known_tabs.insert(tab_id, CrewTabState {
                         tab_id,
                         position: tab.position,
                         name: tab.name.clone(),
@@ -500,26 +465,25 @@ impl State {
                         last_msg_to: None,
                         last_msg_from: None,
                         status_updated_at: None,
-                    },
-                );
-                seen_tab_ids.insert(tab_id);
+                    });
+                }
             }
         }
 
-        // PASS 2: Remove closed tabs
-        let closed: Vec<u32> = self
+        // Remove closed tabs (IDs no longer in TabUpdate)
+        let closed: Vec<usize> = self
             .known_tabs
             .keys()
-            .filter(|tab_id| !seen_tab_ids.contains(tab_id))
+            .filter(|id| !seen_tab_ids.contains(id))
             .cloned()
             .collect();
 
         for tab_id in closed {
             if let Some(crew_tab) = self.known_tabs.remove(&tab_id) {
                 if !crew_tab.user_defined {
-                    eprintln!("[crew:{}:leader] Tab #{} '{}' closed, name returns to pool", self.instance_id, tab_id, crew_tab.name);
+                    eprintln!("[crew:{}:leader] Tab {} '{}' closed, name returns to pool", self.instance_id, tab_id, crew_tab.name);
                 } else {
-                    eprintln!("[crew:{}:leader] Tab #{} '{}' closed (user-defined)", self.instance_id, tab_id, crew_tab.name);
+                    eprintln!("[crew:{}:leader] Tab {} '{}' closed (user-defined)", self.instance_id, tab_id, crew_tab.name);
                 }
             }
         }
@@ -539,12 +503,7 @@ impl State {
             }
         })?;
         let tab = self.tabs.iter().find(|t| t.position == tab_pos)?;
-        let tab_id = parse_default_name(&tab.name).or_else(|| {
-            self.known_tabs.iter()
-                .find(|(_, ct)| ct.name == tab.name)
-                .map(|(id, _)| *id)
-        })?;
-        self.known_tabs.get(&tab_id).map(|ct| ct.name.clone())
+        self.known_tabs.get(&tab.tab_id).map(|ct| ct.name.clone())
     }
 
     fn handle_external_status_update(&mut self, pipe_message: &PipeMessage) -> bool {
@@ -670,21 +629,12 @@ impl State {
             eprintln!("[crew:{}:leader] Looking for tab at position {} in {} tabs",
                 self.instance_id, tab_pos, self.tabs.len());
 
-            // Map tab position to tab_id from current tabs
-            let tab_at_pos = self.tabs.iter().find(|t| t.position == tab_pos);
+            // Map tab position to tab_id using TabInfo.tab_id
+            let tab_id = self.tabs.iter()
+                .find(|t| t.position == tab_pos)
+                .map(|t| t.tab_id);
 
-            if let Some(tab) = tab_at_pos {
-                eprintln!("[crew:{}:leader] Tab at position {}: name='{}' active={}",
-                    self.instance_id, tab_pos, tab.name, tab.active);
-            }
-
-            if let Some(tab_id) = tab_at_pos.and_then(|t| parse_default_name(&t.name).or_else(|| {
-                    // Tab already renamed, find it in known_tabs by name
-                    self.known_tabs.iter()
-                        .find(|(_, ct)| ct.name == t.name)
-                        .map(|(id, _)| *id)
-                }))
-            {
+            if let Some(tab_id) = tab_id {
                 // Update specific tab
                 let (tab_name, old_status, changed) = if let Some(crew_tab) = self.known_tabs.get_mut(&tab_id) {
                     let old = crew_tab.status.status_str();
@@ -1025,7 +975,6 @@ impl ZellijPlugin for State {
                         });
                         pipe_message_to_plugin(
                             MessageToPlugin::new(MSG_LEADER_ACK)
-                                .with_plugin_url("crew")
                                 .with_payload(serde_json::to_string(&ack).unwrap_or_default()),
                         );
                     }
@@ -1089,7 +1038,7 @@ impl ZellijPlugin for State {
                         // Parse inherited state
                         if let Some(state_val) = msg.get("state") {
                             if let Ok(tabs) = serde_json::from_value::<Vec<CrewTabState>>(state_val.clone()) {
-                                let map: HashMap<u32, CrewTabState> = tabs.into_iter()
+                                let map: HashMap<usize, CrewTabState> = tabs.into_iter()
                                     .map(|t| (t.tab_id, t))
                                     .collect();
                                 self.inherited_state = Some(map);
@@ -1317,19 +1266,11 @@ Examples:
             .iter()
             .map(|tab| {
                 let crew_state: Option<&CrewTabState> = if self.is_leader {
-                    // Leader: look up from own state
-                    if let Some(tab_id) = parse_default_name(&tab.name) {
-                        self.known_tabs.get(&tab_id)
-                    } else {
-                        self.known_tabs.values().find(|ct| ct.name == tab.name)
-                    }
+                    // Leader: direct lookup by stable tab_id
+                    self.known_tabs.get(&tab.tab_id)
                 } else {
-                    // Renderer: look up from leader broadcast
-                    if let Some(tab_id) = parse_default_name(&tab.name) {
-                        self.received_tabs.iter().find(|ct| ct.tab_id == tab_id)
-                    } else {
-                        self.received_tabs.iter().find(|ct| ct.name == tab.name)
-                    }
+                    // Renderer: find in broadcast state by tab_id
+                    self.received_tabs.iter().find(|ct| ct.tab_id == tab.tab_id)
                 };
 
                 if let Some(crew_tab) = crew_state {

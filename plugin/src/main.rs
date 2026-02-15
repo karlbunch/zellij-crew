@@ -595,15 +595,34 @@ impl State {
         };
 
         // Find tab by name
-        if let Some(crew_tab) = self.known_tabs.values_mut().find(|t| t.name == name) {
-            if crew_tab.status != new_status {
-                eprintln!("[crew:{}:leader] Updating tab '{}' to status: {:?}", self.instance_id, name, new_status);
+        let found = if let Some(crew_tab) = self.known_tabs.values_mut().find(|t| t.name == name) {
+            let old = crew_tab.status.status_str();
+            let changed = crew_tab.status != new_status;
+            if changed {
                 crew_tab.status = new_status;
                 crew_tab.status_updated_at = Some(epoch_secs());
+            }
+            Some((old, changed))
+        } else {
+            None
+        };
+        if let Some((old_status, changed)) = found {
+            self.log_event(serde_json::json!({
+                "t": "status", "ts": epoch_secs(),
+                "name": name, "old": old_status, "new": state_str,
+                "changed": changed, "via": "name",
+            }));
+            if changed {
+                eprintln!("[crew:{}:leader] Updating tab '{}' to status: {}", self.instance_id, name, state_str);
                 self.broadcast_state();
                 return true;
             }
         } else {
+            self.log_event(serde_json::json!({
+                "t": "status", "ts": epoch_secs(),
+                "name": name, "new": state_str,
+                "error": "tab not found", "via": "name",
+            }));
             eprintln!("[crew:{}:leader] Tab '{}' not found", self.instance_id, name);
         }
         false
@@ -667,46 +686,60 @@ impl State {
                 }))
             {
                 // Update specific tab
-                if let Some(crew_tab) = self.known_tabs.get_mut(&tab_id) {
-                    if crew_tab.status != new_status {
-                        eprintln!("[crew:{}:leader] Updating tab '{}' (id={}) to status: {:?}",
-                            self.instance_id, crew_tab.name, tab_id, new_status);
+                let (tab_name, old_status, changed) = if let Some(crew_tab) = self.known_tabs.get_mut(&tab_id) {
+                    let old = crew_tab.status.status_str();
+                    let changed = crew_tab.status != new_status;
+                    let name = crew_tab.name.clone();
+                    if changed {
                         crew_tab.status = new_status;
                         crew_tab.status_updated_at = Some(epoch_secs());
+                    }
+                    (name, old, changed)
+                } else {
+                    (String::new(), "", false)
+                };
+                if !tab_name.is_empty() {
+                    self.log_event(serde_json::json!({
+                        "t": "status", "ts": epoch_secs(),
+                        "name": tab_name, "pane": pane_id,
+                        "old": old_status, "new": state_str,
+                        "changed": changed, "via": "pane",
+                    }));
+                    if changed {
+                        eprintln!("[crew:{}:leader] Updating tab '{}' (id={}) to status: {}",
+                            self.instance_id, tab_name, tab_id, state_str);
                         self.broadcast_state();
                         return true;
                     }
                 }
             } else {
+                self.log_event(serde_json::json!({
+                    "t": "status", "ts": epoch_secs(),
+                    "pane": pane_id, "new": state_str,
+                    "error": "unmapped tab_position", "via": "pane",
+                }));
                 eprintln!("[crew:{}:leader] Could not map tab_position {} to tab_id", self.instance_id, tab_pos);
             }
         } else {
+            self.log_event(serde_json::json!({
+                "t": "status", "ts": epoch_secs(),
+                "pane": pane_id, "new": state_str,
+                "error": "pane not found", "via": "pane",
+            }));
             eprintln!("[crew:{}:leader] Pane {} not found in any tab", self.instance_id, pane_id);
         }
 
         false
     }
 
-    fn log_tell_message(&self, msg_id: u32, sender: &str, dest: &str, pane_id: u32, message: &str) {
+    fn log_event(&self, entry: serde_json::Value) {
         // WASI /tmp maps to /tmp/zellij-{uid} on host; zellij-log/ is already there
         let log_path = "/tmp/zellij-log/zellij-crew-messages.log";
-        let ts = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        let entry = serde_json::json!({
-            "ts": ts,
-            "id": msg_id,
-            "from": sender,
-            "to": dest,
-            "pane": pane_id,
-            "msg": message,
-        });
         let mut line = entry.to_string();
         line.push('\n');
         match OpenOptions::new().create(true).append(true).open(log_path) {
             Ok(mut f) => { let _ = f.write_all(line.as_bytes()); }
-            Err(e) => eprintln!("[crew:{}:leader] Failed to write message log: {}", self.instance_id, e),
+            Err(e) => eprintln!("[crew:{}:leader] Failed to write event log: {}", self.instance_id, e),
         }
     }
 
@@ -788,7 +821,11 @@ impl State {
                 write_to_pane_id(formatted.into_bytes(), PaneId::Terminal(pane_id));
                 self.pending_tell_enter = Some(pane_id);
                 set_timeout(self.config.tell_delay_ms as f64 / 1000.0);
-                self.log_tell_message(msg_id, &sender, &dest_name, pane_id, message);
+                self.log_event(serde_json::json!({
+                    "t": "msg", "ts": epoch_secs(),
+                    "id": msg_id, "from": sender, "to": dest_name,
+                    "pane": pane_id, "msg": message,
+                }));
                 if let PipeSource::Cli(pipe_id) = &pipe_message.source {
                     cli_pipe_output(pipe_id, &format!(
                         "msg#{} sent to {} on pane {}\n", msg_id, dest_name, pane_id

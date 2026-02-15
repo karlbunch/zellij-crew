@@ -105,6 +105,7 @@ The plugin runs as a tab-bar pane in each tab (via layout). Instances elect a le
 | `names` | space-separated | NATO phonetic | Pool of names to assign |
 | `mode` | `round-robin`, `fill-in` | `round-robin` | Allocation strategy |
 | `hide_swap_layout_indication` | `true`, `false` | `false` | Hide swap layout status in tab bar |
+| `idle_sleep_secs` | seconds (integer) | `300` | Auto-sleep after no terminal output (0 = disabled) |
 
 **Note:** `show_position` feature (showing "alpha <1>" style names) is planned but not yet implemented.
 
@@ -143,7 +144,7 @@ Crew displays activity indicators next to tab names to show what's happening in 
 | Idle | 🥱 | Ready for input, at prompt | External signal |
 | Working | 🤖 | Agent actively processing | External signal |
 | Question | 🙋 | Agent has a question | External signal |
-| Sleeping | 😴 | No activity (unused) | (Not yet implemented) |
+| Sleeping | 😴 | No activity for a while | Auto (idle_sleep_secs) or external signal |
 | Watching | 👀 | Monitoring/observing | External signal |
 | Attention | 🔔 | Needs attention | External signal |
 
@@ -243,6 +244,7 @@ The plugin requires these permissions:
 - `ChangeApplicationState` - To rename tabs
 - `MessageAndLaunchOtherPlugins` - To broadcast state between plugin instances
 - `ReadCliPipes` - To receive status updates from external tools
+- `ReadPaneContents` - To detect terminal activity via PaneRenderReport
 
 Zellij will prompt for permissions on first load.
 

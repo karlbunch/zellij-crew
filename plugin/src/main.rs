@@ -78,6 +78,8 @@ struct Config {
     tell_append: String,
     /// Delay in ms between message text and Enter keystroke.
     tell_delay_ms: u32,
+    /// Seconds of no terminal output before an idle tab transitions to sleeping (0 = disabled).
+    idle_sleep_secs: u64,
 }
 
 impl Config {
@@ -128,6 +130,11 @@ impl Config {
             .and_then(|s| s.parse().ok())
             .unwrap_or(250);
 
+        let idle_sleep_secs = config
+            .get("idle_sleep_secs")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(300);
+
         Config {
             names,
             mode,
@@ -135,6 +142,7 @@ impl Config {
             status_indicators,
             tell_append,
             tell_delay_ms,
+            idle_sleep_secs,
         }
     }
 
@@ -218,6 +226,8 @@ struct CrewTabState {
     last_msg_from: Option<(u32, u64)>,     // (msg_id, epoch_secs) - last message FROM this tab
     #[serde(skip)]
     status_updated_at: Option<u64>,        // epoch_secs when status last changed
+    #[serde(skip)]
+    last_activity_at: Option<u64>,         // epoch_secs of last PaneRenderReport for this tab
 }
 
 #[derive(Default)]
@@ -308,6 +318,11 @@ impl State {
             MessageToPlugin::new(MSG_LEADER_CLAIM)
                 .with_payload(serde_json::to_string(&payload).unwrap_or_default()),
         );
+
+        // Arm periodic activity check timer (if idle_sleep_secs enabled)
+        if self.config.idle_sleep_secs > 0 {
+            set_timeout(30.0);
+        }
 
         self.broadcast_state();
     }
@@ -447,6 +462,7 @@ impl State {
                             last_msg_to: None,
                             last_msg_from: None,
                             status_updated_at: None,
+                            last_activity_at: None,
                         });
                     } else {
                         eprintln!("[crew:{}:leader] Pool exhausted, leaving tab {} unnamed", self.instance_id, tab_id);
@@ -465,6 +481,7 @@ impl State {
                         last_msg_to: None,
                         last_msg_from: None,
                         status_updated_at: None,
+                        last_activity_at: None,
                     });
                 }
             }
@@ -836,6 +853,7 @@ impl ZellijPlugin for State {
             PermissionType::MessageAndLaunchOtherPlugins,
             PermissionType::ReadCliPipes,
             PermissionType::WriteToStdin,
+            PermissionType::ReadPaneContents,
         ]);
         subscribe(&[
             EventType::TabUpdate,
@@ -845,6 +863,7 @@ impl ZellijPlugin for State {
             EventType::Timer,
             EventType::BeforeClose,
             EventType::PermissionRequestResult,
+            EventType::PaneRenderReport,
         ]);
 
         // Election starts after permission grant (pipe_message_to_plugin
@@ -892,6 +911,45 @@ impl ZellijPlugin for State {
                 }
                 should_render = false;
             }
+            Event::PaneRenderReport(pane_contents) => {
+                if self.is_leader {
+                    let now = epoch_secs();
+                    for pane_id in pane_contents.keys() {
+                        if let PaneId::Terminal(id) = pane_id {
+                            // Map pane_id -> tab position via pane_manifest
+                            let tab_pos = self.pane_manifest.as_ref().and_then(|m| {
+                                m.panes.iter().find_map(|(pos, panes)| {
+                                    if panes.iter().any(|p| !p.is_plugin && p.id == *id) {
+                                        Some(*pos)
+                                    } else {
+                                        None
+                                    }
+                                })
+                            });
+                            // Map tab position -> tab_id via self.tabs
+                            if let Some(pos) = tab_pos {
+                                if let Some(tab_id) = self.tabs.iter()
+                                    .find(|t| t.position == pos)
+                                    .map(|t| t.tab_id)
+                                {
+                                    if let Some(crew_tab) = self.known_tabs.get_mut(&tab_id) {
+                                        crew_tab.last_activity_at = Some(now);
+                                        // Wake sleeping tabs on terminal output
+                                        if crew_tab.status == ActivityStatus::Sleeping {
+                                            eprintln!("[crew:{}:leader] Tab '{}' woke from sleeping (terminal activity)",
+                                                self.instance_id, crew_tab.name);
+                                            crew_tab.status = ActivityStatus::Idle;
+                                            crew_tab.status_updated_at = Some(now);
+                                            should_render = true;
+                                            self.broadcast_state();
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
             Event::Timer(_) => {
                 if let Some(pane_id) = self.pending_tell_enter.take() {
                     write_to_pane_id(vec![b'\r'], PaneId::Terminal(pane_id));
@@ -906,6 +964,38 @@ impl ZellijPlugin for State {
                     }
                     should_render = true;
                 }
+                // Periodic activity check: transition stale tabs to sleeping
+                if self.is_leader && self.config.idle_sleep_secs > 0 {
+                    let now = epoch_secs();
+                    let threshold = self.config.idle_sleep_secs;
+                    let mut changed = false;
+                    for crew_tab in self.known_tabs.values_mut() {
+                        if crew_tab.status == ActivityStatus::Sleeping
+                            || crew_tab.status == ActivityStatus::Unknown
+                        {
+                            continue;
+                        }
+                        let status_stale = crew_tab.status_updated_at
+                            .map(|t| now.saturating_sub(t) >= threshold)
+                            .unwrap_or(false);
+                        let activity_stale = crew_tab.last_activity_at
+                            .map(|t| now.saturating_sub(t) >= threshold)
+                            .unwrap_or(true);
+                        if status_stale && activity_stale {
+                            eprintln!("[crew:{}:leader] Tab '{}' idle too long, transitioning to sleeping",
+                                self.instance_id, crew_tab.name);
+                            crew_tab.status = ActivityStatus::Sleeping;
+                            crew_tab.status_updated_at = Some(now);
+                            changed = true;
+                        }
+                    }
+                    if changed {
+                        self.broadcast_state();
+                        should_render = true;
+                    }
+                    // Re-arm periodic timer
+                    set_timeout(30.0);
+                }
             }
             Event::BeforeClose => {
                 self.resign_leadership();
@@ -919,6 +1009,7 @@ impl ZellijPlugin for State {
                     EventType::Mouse,
                     EventType::Timer,
                     EventType::BeforeClose,
+                    EventType::PaneRenderReport,
                 ]);
                 // Start election now that pipe messaging is available
                 self.start_election();
@@ -1229,6 +1320,7 @@ Examples:
                             "name": tab.name,
                             "status": status_str,
                             "status_updated_at": tab.status_updated_at,
+                            "last_activity_at": tab.last_activity_at,
                             "last_msg_to": msg_to,
                             "last_msg_from": msg_from,
                             "pane": pane_info,

@@ -105,7 +105,7 @@ The plugin runs as a tab-bar pane in each tab (via layout). Instances elect a le
 | `names` | space-separated | NATO phonetic | Pool of names to assign |
 | `mode` | `round-robin`, `fill-in` | `round-robin` | Allocation strategy |
 | `hide_swap_layout_indication` | `true`, `false` | `false` | Hide swap layout status in tab bar |
-| `idle_sleep_secs` | seconds (integer) | `300` | Auto-sleep after no terminal output (0 = disabled) |
+| `idle_sleep_secs` | seconds (integer) | `30` | Auto-sleep after no terminal output (0 = disabled) |
 
 **Note:** `show_position` feature (showing "alpha <1>" style names) is planned but not yet implemented.
 

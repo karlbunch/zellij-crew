@@ -133,7 +133,7 @@ impl Config {
         let idle_sleep_secs = config
             .get("idle_sleep_secs")
             .and_then(|s| s.parse().ok())
-            .unwrap_or(300);
+            .unwrap_or(30);
 
         Config {
             names,
@@ -321,7 +321,7 @@ impl State {
 
         // Arm periodic activity check timer (if idle_sleep_secs enabled)
         if self.config.idle_sleep_secs > 0 {
-            set_timeout(30.0);
+            set_timeout(5.0);
         }
 
         self.broadcast_state();
@@ -994,7 +994,7 @@ impl ZellijPlugin for State {
                         should_render = true;
                     }
                     // Re-arm periodic timer
-                    set_timeout(30.0);
+                    set_timeout(5.0);
                 }
             }
             Event::BeforeClose => {

@@ -914,6 +914,7 @@ impl ZellijPlugin for State {
             Event::PaneRenderReport(pane_contents) => {
                 if self.is_leader {
                     let now = epoch_secs();
+                    let mut woke_tabs: Vec<String> = Vec::new();
                     for pane_id in pane_contents.keys() {
                         if let PaneId::Terminal(id) = pane_id {
                             // Map pane_id -> tab position via pane_manifest
@@ -938,15 +939,25 @@ impl ZellijPlugin for State {
                                         if crew_tab.status == ActivityStatus::Sleeping {
                                             eprintln!("[crew:{}:leader] Tab '{}' woke from sleeping (terminal activity)",
                                                 self.instance_id, crew_tab.name);
+                                            woke_tabs.push(crew_tab.name.clone());
                                             crew_tab.status = ActivityStatus::Idle;
                                             crew_tab.status_updated_at = Some(now);
                                             should_render = true;
-                                            self.broadcast_state();
                                         }
                                     }
                                 }
                             }
                         }
+                    }
+                    if !woke_tabs.is_empty() {
+                        for name in &woke_tabs {
+                            self.log_event(serde_json::json!({
+                                "t": "status", "ts": now,
+                                "name": name, "old": "sleeping", "new": "idle",
+                                "changed": true, "via": "activity_wake",
+                            }));
+                        }
+                        self.broadcast_state();
                     }
                 }
             }
@@ -969,6 +980,7 @@ impl ZellijPlugin for State {
                     let now = epoch_secs();
                     let threshold = self.config.idle_sleep_secs;
                     let mut changed = false;
+                    let mut slept_tabs: Vec<(String, String)> = Vec::new(); // (name, old_status)
                     for crew_tab in self.known_tabs.values_mut() {
                         if crew_tab.status == ActivityStatus::Sleeping
                             || crew_tab.status == ActivityStatus::Unknown
@@ -982,14 +994,23 @@ impl ZellijPlugin for State {
                             .map(|t| now.saturating_sub(t) >= threshold)
                             .unwrap_or(true);
                         if status_stale && activity_stale {
+                            let old = crew_tab.status.status_str().to_string();
                             eprintln!("[crew:{}:leader] Tab '{}' idle too long, transitioning to sleeping",
                                 self.instance_id, crew_tab.name);
+                            slept_tabs.push((crew_tab.name.clone(), old));
                             crew_tab.status = ActivityStatus::Sleeping;
                             crew_tab.status_updated_at = Some(now);
                             changed = true;
                         }
                     }
                     if changed {
+                        for (name, old) in &slept_tabs {
+                            self.log_event(serde_json::json!({
+                                "t": "status", "ts": now,
+                                "name": name, "old": old, "new": "sleeping",
+                                "changed": true, "via": "auto_sleep",
+                            }));
+                        }
                         self.broadcast_state();
                         should_render = true;
                     }

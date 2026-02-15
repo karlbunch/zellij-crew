@@ -155,11 +155,12 @@ fn do_setup() {
             process::exit(1);
         });
 
-        let already = arr.iter().any(|e| has_our_hook(e));
+        let new_entry = make_hook_entry(mapping);
+        let already = arr.iter().any(|e| e == &new_entry);
         if already {
             skipped += 1;
         } else {
-            arr.push(make_hook_entry(mapping));
+            arr.push(new_entry);
             installed += 1;
         }
     }

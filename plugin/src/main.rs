@@ -468,15 +468,22 @@ impl State {
                         eprintln!("[crew:{}:leader] Pool exhausted, leaving tab {} unnamed", self.instance_id, tab_id);
                     }
                 } else {
-                    // User-defined name on a new tab - track it
-                    eprintln!("[crew:{}:leader] New tab {} with user name '{}' (pos {})",
-                        self.instance_id, tab_id, tab.name, tab.position);
+                    // Tab already has a name — check if it's from our pool
+                    // (e.g. surviving a detach/reattach) or truly user-defined
+                    let from_pool = self.config.names.iter().any(|n| n == &tab.name);
+                    if from_pool {
+                        eprintln!("[crew:{}:leader] New tab {} with pool name '{}' (pos {})",
+                            self.instance_id, tab_id, tab.name, tab.position);
+                    } else {
+                        eprintln!("[crew:{}:leader] New tab {} with user name '{}' (pos {})",
+                            self.instance_id, tab_id, tab.name, tab.position);
+                    }
                     self.known_tabs.insert(tab_id, CrewTabState {
                         tab_id,
                         position: tab.position,
                         name: tab.name.clone(),
                         pending_rename: None,
-                        user_defined: true,
+                        user_defined: !from_pool,
                         status: ActivityStatus::Unknown,
                         last_msg_to: None,
                         last_msg_from: None,

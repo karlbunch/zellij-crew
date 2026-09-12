@@ -1,47 +1,35 @@
-# Upstream Source
+# Upstream zellij
 
-This plugin is based on the official zellij tab-bar plugin.
+zellij-crew builds against a sibling checkout of zellij at `../zellij` via path
+dependencies, not crates.io. Both crates are pinned to one zellij commit so builds
+are reproducible.
 
-## Source
+## Pinned version
 
-**Repository:** https://github.com/zellij-org/zellij
-**Path:** `default-plugins/tab-bar/src/`
-**Commit:** `889bd06f447f9d50ee46b8efc7d9970d3693cb96`
-**Date:** 2025-10-21
-**Message:** Migrate from wasmtime to wasmi (#4449)
+| | |
+|--|--|
+| Repository | https://github.com/zellij-org/zellij |
+| Commit | `a16232338` |
+| Workspace version | 0.46.0 |
 
-## Architecture
+## Dependencies
 
-This plugin is a full rewrite of the tab-bar with crew functionality fully integrated.
+| crate | used by | why |
+|-------|---------|-----|
+| `zellij-tile` | `plugin/` | plugin API: `ZellijPlugin`, `subscribe`, `request_permission`, `rename_tab_with_id` |
+| `zellij-client` | `cli/` | connect to the session and send actions over zellij's IPC |
+| `zellij-utils` | `cli/` | shared types, session resolution, the `vendored_curl` feature for static musl |
 
-| File | Status | Notes |
-|------|--------|-------|
-| `line.rs` | Verbatim copy | No modifications from upstream |
-| `tab.rs` | Verbatim copy | No modifications from upstream |
-| `main.rs` | Complete rewrite | 817 lines - all crew logic integrated |
+The client/server IPC uses a versioned contract (`CLIENT_SERVER_CONTRACT_VERSION`).
+As long as our pinned commit and the installed zellij share that contract version,
+the CLI talks to the running session cleanly.
 
-**Important:** Unlike typical forks, main.rs is NOT a lightly-modified upstream file. It's a complete reimplementation that combines:
-- Tab-bar rendering (from upstream)
-- Leader/renderer architecture
-- Name allocation and tracking
-- Activity status system
-- Pipe message handling
+## Bumping
 
-**There is no separate crew.rs module.** All logic lives in main.rs.
+1. Update `../zellij` to the new commit or tag.
+2. `cargo build` the workspace; fix any API drift (the plugin API and the `Action`
+   enum are the usual movers).
+3. Run the [TESTING.md](TESTING.md) suite against a throwaway session.
+4. Update the commit and version in the table above.
 
-## Syncing with upstream
-
-The tab-bar source changes infrequently. To check for updates:
-
-```bash
-cd /path/to/zellij
-git log --oneline -5 -- default-plugins/tab-bar/src/
-```
-
-To sync (safe - line.rs and tab.rs are verbatim):
-```bash
-cp /path/to/zellij/default-plugins/tab-bar/src/line.rs src/
-cp /path/to/zellij/default-plugins/tab-bar/src/tab.rs src/
-```
-
-**WARNING:** Do NOT sync main.rs. It's a complete rewrite and cannot be mechanically merged with upstream. If upstream changes tab-bar's API or event handling, manual porting is required.
+Keep the installed zellij and this pinned commit on the same contract version.

@@ -21,7 +21,7 @@ PERMS      = $(HOME)/.cache/zellij/permissions.kdl
 # (start-or-reload-plugin only reaches an instance with an identical configuration).
 NAMES ?=
 
-.PHONY: build build-plugin build-cli install install-plugin install-cli install-permissions cross reload clean
+.PHONY: build build-plugin build-cli build-cli-native install install-plugin install-cli install-permissions cross reload clean
 
 build: build-plugin build-cli
 
@@ -29,10 +29,14 @@ build-plugin:
 	cargo build --release --target $(WASM_TARGET) -p zellij-crew-plugin
 
 build-cli:
+	@command -v musl-gcc >/dev/null || { echo "musl-gcc not found: sudo apt install musl-tools (Debian/Ubuntu) or xbps-install musl (Void)" >&2; exit 1; }
 	cargo build --release --target $(MUSL_TARGET) -p zellij-crew-cli
 
-# The CLI is being rewritten; until it lands, `install` ships only the plugin.
-install: install-plugin
+# Native (non-static) CLI build for local testing; no musl toolchain needed.
+build-cli-native:
+	cargo build --release -p zellij-crew-cli
+
+install: install-plugin install-cli
 
 install-plugin: build-plugin
 	@mkdir -p $(CONFIG_DIR)

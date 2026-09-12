@@ -1,14 +1,20 @@
 [package]
 name = "zellij-crew-cli"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 license = "MIT"
-description = "CLI companion for zellij-crew: sends status updates and manages Claude Code hooks"
+description = "zellij-crew CLI: message other zellij tabs by name, list tabs, print this tab's name"
 
 [[bin]]
 name = "zellij-crew"
 path = "src/main.rs"
 
 [dependencies]
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
+zellij-client = { path = "../../zellij/zellij-client" }
+zellij-utils = { path = "../../zellij/zellij-utils", features = ["vendored_curl"] }
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+kdl = "4"
+libc = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

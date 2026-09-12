@@ -19,9 +19,12 @@ Requires a sibling checkout of zellij at `../zellij` (the crates are path
 dependencies). See [UPSTREAM.md](UPSTREAM.md) for the pinned commit.
 
 ```bash
-make install              # builds and copies ~/.config/zellij/zellij-crew.wasm
-make install-permissions  # grants it read/change state ahead of time, no prompt
+make install              # plugin -> ~/.config/zellij/zellij-crew.wasm, CLI -> ~/.local/bin/zellij-crew
+make install-permissions  # grants the plugin read/change state ahead of time, no prompt
 ```
+
+The CLI is a static musl binary, so linking it needs `musl-tools` (Debian/Ubuntu)
+or `musl` (Void). `make build-cli-native` builds a non-static one without that.
 
 Then enable the naming daemon in `~/.config/zellij/config.kdl`:
 
@@ -48,6 +51,7 @@ zellij-crew tell Bob "can you take the API tests?"
 zellij-crew list            # tabs, names, recent messages
 zellij-crew list --json
 zellij-crew name            # this pane's tab name
+zellij-crew config          # effective settings and paths
 ```
 
 ## Configuration
@@ -61,10 +65,10 @@ them. See [DESIGN.md](DESIGN.md#configuration) for the schema.
 
 | Target | Description |
 |--------|-------------|
-| `make install` | build the plugin and copy it to `~/.config/zellij/zellij-crew.wasm` |
+| `make install` | build the plugin and the static CLI and copy both into place |
 | `make install-permissions` | pre-seed the plugin's grant in `~/.cache/zellij/permissions.kdl` |
 | `make reload NAMES="..."` | reinstall and hot-reload the daemon in the running session; `NAMES` must match `config.kdl` |
-| `make build-cli` / `install-cli` | the CLI, once it lands (static musl, needs `musl-tools`) |
+| `make build-cli-native` | non-static CLI for local testing, no musl toolchain needed |
 | `make cross` | cross-build the CLI for aarch64 musl |
 | `make clean` | `cargo clean` |
 

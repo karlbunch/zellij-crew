@@ -80,20 +80,29 @@ Start each of these with no entry for the wasm in `~/.cache/zellij/permissions.k
 Scripts that create and immediately rename a tab should use `new-tab --name`; a
 `new-tab` followed by `rename-tab` can lose the race to the daemon.
 
-## crew CLI (planned)
+## crew CLI
+
+Run the binary from outside the session, acting as a pane by setting the two
+variables every real pane has: `ZELLIJ_SESSION_NAME=zztest ZELLIJ_PANE_ID=0
+zellij-crew ...` makes it "the first pane of tab 0", so `tell` reports the sender as
+that tab's name and `name` prints it.
+
+To see exactly what a receiving pane gets, run a raw-tty reader in it that logs every
+`read()` with a timestamp; then the message and the trailing `\r` show up as two
+reads with the configured gap between them. A fake `claude` on the server's `PATH`
+tests the pane preference, but it must keep `claude` as its argv[0]
+(`exec -a claude python3 reader.py ...`): zellij reports the foreground process as
+the pane command, so a plain wrapper script would read as `python3`.
 
 | # | Case | Expected |
 |---|------|----------|
-| C1 | `tell Bob "hi"` from another tab | message text then Enter arrive in Bob's pane as separate reads |
-| C2 | `tell` targets the `claude` pane | when a tab has a `claude` pane, that pane receives it |
-| C3 | `tell <unknown>` | error, non-zero exit |
-| C4 | `tell` to a tab with no terminal pane | error, non-zero exit |
-| C5 | `list` / `list --json` | tabs with id, name, last message to/from |
-| C6 | `name` | prints this pane's tab name |
-| C7 | message id increments | `next_msg_id` advances; `messages.jsonl` gets one line per `tell` |
-
-Verify C1/C2 by dumping the receiving pane:
-
-```bash
-zellij -s zztest action dump-screen -p terminal_<id>
-```
+| C1 | `tell bob "hi"` from pane 0 (case-insensitive name) | `msg#1 sent to Bob on pane N`; the pane sees one read with `\n[CREW MESSAGE #1 from Alice; to: Bob] hi\n<postfix>\n`, then a second read `\r` about 250 ms later |
+| C1b | `--config` pointing at a file with a custom `tell` block | prefix, postfix and `enter_delay_ms` from the file are used |
+| C2 | Bob's tab has a `claude` pane and focus is on another pane | the `claude` pane receives the message, the focused one does not |
+| C3 | `tell nobody hi` | error listing the tabs that exist, exit 1 |
+| C4 | no `ZELLIJ_SESSION_NAME` with two sessions running | "several zellij sessions are running", exit 1 |
+| C5 | `list` / `list --json` | one row per tab with id, position, name, pane count, status, last message to/from |
+| C6 | `name` from pane 0 and pane 1 | `Alice`, `Bob`; without `ZELLIJ_PANE_ID`: "not inside a zellij pane", exit 1 |
+| C7 | `status working` then `list` | the status shows on that pane's tab |
+| C8 | after three tells | `next_msg_id` is 4, `messages.jsonl` has three lines, `zellij-crew.log` three lines |
+| C9 | `config` | prints the config path (and whether it exists), session, state dir, log path, and the effective `tell` settings |

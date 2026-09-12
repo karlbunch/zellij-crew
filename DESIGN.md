@@ -23,9 +23,7 @@ mechanisms rather than reimplementing them:
 | Naming daemon | headless background wasm plugin | rename new `Tab #N` tabs from the pool |
 | crew CLI | native musl binary linking `zellij-client` / `zellij-utils` | `tell` / `list` / `name` / `status` |
 
-The naming daemon is done and tested. The crew CLI is the next piece; `cli/` still
-holds the previous tool until then, which is why `make install` currently ships only
-the plugin.
+Both are built and verified against a live session; see [TESTING.md](TESTING.md).
 
 ## Component 1: Naming daemon (background plugin)
 
@@ -174,14 +172,27 @@ protocol reimplementation; the library owns the transport.
 | `tell <name> <message...>` | deliver a message into the named tab's pane |
 | `list [--json]` | tabs with id, name, and last message to / from |
 | `name` | print this pane's tab name (for scripts and prompts) |
-| `status <state>` | write this tab's status to the state dir; no zellij call, reserved for a future status-indicator revival |
+| `status <state>` | write this pane's status to the state dir; no zellij call, reserved for a future status-indicator revival |
+| `config` | show the effective configuration, session, and state paths |
+
+`tell` prints `msg#<id> sent to <Name> on pane <n>` and exits non-zero with a list of
+the tabs that do exist when the name is unknown.
+
+### Session and sender
+
+The CLI talks to the session named by `ZELLIJ_SESSION_NAME` if it exists, else the
+only running session; with several running and no variable set it refuses. The
+sender name is the caller's own tab, resolved from `ZELLIJ_PANE_ID`; outside a pane
+it is `unknown`. Both variables are set in every zellij pane, so agents get this for
+free, and a script can set them to act as a given pane.
 
 ### How `tell` delivers
 
 1. Resolve the destination tab by name (case-insensitive) from the live tab and pane
    list.
-2. Pick the destination pane: prefer the pane whose running command is `claude`,
-   otherwise the tab's active pane.
+2. Pick the destination pane: prefer a pane whose foreground command is `claude` (by
+   the basename of its first word, which is what zellij reports as the pane
+   command), otherwise the tab's active pane, otherwise any live one.
 3. Write the formatted message with `WriteCharsToPaneId`, then after `enter_delay_ms`
    write a carriage return with `WriteToPaneId`, so Enter arrives as a separate pty
    read. Sent in one write, some pty setups fold it into the message and the line is
@@ -230,7 +241,9 @@ Under zellij's own tmp dir, `/tmp/zellij-<uid>/`, per session:
 The daemon keeps no state on disk and writes no log file of its own: its few
 `eprintln!` lines (pool size at load, pool exhausted, permission denied) land in
 `zellij.log`, tagged with the plugin path. Only the CLI's `tell` counter and log
-persist, and only those need the lock.
+persist, and only those need the lock. They are keyed by session name, so a session
+killed and recreated under the same name continues its message numbering until
+`/tmp` is cleared.
 
 ## Build
 
@@ -243,10 +256,12 @@ persist, and only those need the lock.
   feature so the musl build is fully static.
 - The toolchain is pinned to 1.95.0 to match zellij's `rust-version`. The pinned
   zellij commit is recorded in [UPSTREAM.md](UPSTREAM.md).
-- Makefile: `install` (plugin only until the CLI lands), `install-permissions`,
-  `reload` for the dev loop, `cross` for aarch64. `reload` hot-reloads only an
-  instance with an identical configuration, so pass `NAMES="..."` equal to the
-  `config.kdl` value; a mismatch makes zellij start a second, visible instance.
+- Makefile: `install` builds and installs both, `install-permissions`, `reload` for
+  the plugin dev loop, `build-cli-native` for a non-static CLI when no musl
+  toolchain is at hand, `cross` for aarch64. `build-cli` refuses to start without
+  `musl-gcc` and says what to install. `reload` hot-reloads only an instance with an
+  identical configuration, so pass `NAMES="..."` equal to the `config.kdl` value; a
+  mismatch makes zellij start a second, visible instance.
 
 ## Edge cases
 

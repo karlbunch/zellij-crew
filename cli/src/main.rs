@@ -1,301 +1,217 @@
-use serde_json::Value;
-use std::env;
-use std::fs;
-use std::os::unix::process::CommandExt;
+//! zellij-crew: message other zellij tabs by name.
+//!
+//! Tabs are named by the zellij-crew naming daemon (a background plugin); this tool
+//! delivers messages into a named tab, lists tabs, and prints the caller's tab name.
+
+mod config;
+mod state;
+mod zellij;
+
+use anyhow::{anyhow, bail, Result};
+use clap::{Parser, Subcommand};
 use std::path::PathBuf;
-use std::process;
+use std::process::ExitCode;
+use std::time::Duration;
 
-const VALID_STATES: &[&str] = &[
-    "unknown", "idle", "working", "question", "sleeping", "watching", "attention",
-];
+use config::Config;
+use state::{log_line, now, Message, State};
+use zellij::{Pane, Session};
 
-struct HookMapping {
-    event: &'static str,
-    state: &'static str,
-    matcher: Option<&'static str>,
+#[derive(Parser)]
+#[command(name = "zellij-crew", version, about = "Message other zellij tabs by name")]
+struct Cli {
+    /// zellij-crew.kdl to use (default: next to zellij's config.kdl)
+    #[arg(long, global = true, env = "ZELLIJ_CREW_CONFIG", value_name = "FILE")]
+    config: Option<PathBuf>,
+    #[command(subcommand)]
+    cmd: Cmd,
 }
 
-const HOOK_MAPPINGS: &[HookMapping] = &[
-    HookMapping { event: "SessionStart",       state: "watching",  matcher: None },
-    HookMapping { event: "UserPromptSubmit",    state: "working",   matcher: None },
-    HookMapping { event: "PreToolUse",          state: "working",   matcher: Some("*") },
-    HookMapping { event: "SubagentStart",       state: "working",   matcher: Some("*") },
-    HookMapping { event: "Stop",                state: "idle",      matcher: None },
-    HookMapping { event: "Notification",        state: "idle",      matcher: Some("idle_prompt") },
-    HookMapping { event: "Notification",        state: "question",  matcher: Some("permission_prompt") },
-    HookMapping { event: "PermissionRequest",   state: "question",  matcher: Some("*") },
-    HookMapping { event: "SessionEnd",          state: "unknown",   matcher: None },
-];
-
-fn cli_path() -> String {
-    "\"$HOME/.config/zellij/zellij-crew\"".to_string()
+#[derive(Subcommand)]
+enum Cmd {
+    /// Deliver a message into the named tab (case-insensitive)
+    Tell {
+        name: String,
+        #[arg(required = true, trailing_var_arg = true)]
+        message: Vec<String>,
+    },
+    /// List tabs with their names and recent messages
+    List {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Print this pane's tab name
+    Name,
+    /// Record this pane's status (kept for a future status indicator)
+    Status { state: String },
+    /// Show the effective configuration and paths
+    Config,
 }
 
-fn print_help() {
-    eprintln!("zellij-crew - CLI companion for zellij-crew plugin");
-    eprintln!();
-    eprintln!("Usage:");
-    eprintln!("  zellij-crew status <state>          Send status update to plugin");
-    eprintln!("  zellij-crew tell <name> <message>   Send message to another tab");
-    eprintln!("  zellij-crew state                   Show detailed per-tab state (JSON)");
-    eprintln!("  zellij-crew --setup                 Install hooks into ~/.claude/settings.json");
-    eprintln!("  zellij-crew --remove                Remove hooks from ~/.claude/settings.json");
-    eprintln!("  zellij-crew --help                  Show this help");
-    eprintln!();
-    eprintln!("Valid states:");
-    for s in VALID_STATES {
-        eprintln!("  {}", s);
-    }
-    eprintln!();
-    eprintln!("Hook mappings (installed by --setup):");
-    for h in HOOK_MAPPINGS {
-        let m = h.matcher.unwrap_or("-");
-        eprintln!("  {:25} -> {:10} (matcher: {})", h.event, h.state, m);
+fn main() -> ExitCode {
+    let cli = Cli::parse();
+    match run(cli) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("zellij-crew: {e:#}");
+            ExitCode::FAILURE
+        },
     }
 }
 
-// ============================================================================
-// Settings management (--setup / --remove)
-// ============================================================================
-
-fn settings_path() -> PathBuf {
-    let home = env::var("HOME").unwrap_or_else(|_| {
-        eprintln!("zellij-crew: $HOME not set");
-        process::exit(1);
-    });
-    PathBuf::from(home).join(".claude").join("settings.json")
-}
-
-fn read_settings(path: &PathBuf) -> Value {
-    if !path.exists() {
-        return serde_json::json!({"hooks": {}});
+fn run(cli: Cli) -> Result<()> {
+    match cli.cmd {
+        Cmd::Tell { name, message } => tell(cli.config.as_deref(), &name, &message.join(" ")),
+        Cmd::List { json } => list(json),
+        Cmd::Name => {
+            let session = Session::connect()?;
+            let panes = session.panes()?;
+            println!("{}", own_tab(&session, &panes)?.tab_name);
+            Ok(())
+        },
+        Cmd::Status { state } => {
+            let pane = own_pane_id().ok_or_else(|| anyhow!("not inside a zellij pane"))?;
+            State::open(&zellij::resolve_session_name()?)?.set_status(pane, &state)
+        },
+        Cmd::Config => show_config(cli.config.as_deref()),
     }
-    let data = fs::read_to_string(path).unwrap_or_else(|e| {
-        eprintln!("zellij-crew: failed to read {}: {}", path.display(), e);
-        process::exit(1);
-    });
-    serde_json::from_str(&data).unwrap_or_else(|e| {
-        eprintln!("zellij-crew: failed to parse {}: {}", path.display(), e);
-        process::exit(1);
-    })
 }
 
-fn write_settings(path: &PathBuf, value: &Value) {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).unwrap_or_else(|e| {
-            eprintln!("zellij-crew: failed to create {}: {}", parent.display(), e);
-            process::exit(1);
+fn own_pane_id() -> Option<u32> {
+    std::env::var("ZELLIJ_PANE_ID").ok()?.trim().parse().ok()
+}
+
+fn own_tab<'a>(session: &Session, panes: &'a [Pane]) -> Result<&'a Pane> {
+    let id = session.own_pane_id().ok_or_else(|| anyhow!("not inside a zellij pane"))?;
+    panes
+        .iter()
+        .find(|p| p.is_terminal() && p.id == id)
+        .ok_or_else(|| anyhow!("pane {id} not found in the session"))
+}
+
+fn tell(config: Option<&std::path::Path>, name: &str, message: &str) -> Result<()> {
+    let cfg = Config::load(config)?;
+    let session = Session::connect()?;
+    let panes = session.panes()?;
+
+    let from = own_tab(&session, &panes)
+        .map(|p| p.tab_name.clone())
+        .unwrap_or_else(|_| "unknown".to_owned());
+
+    let dest: Vec<&Pane> = panes
+        .iter()
+        .filter(|p| p.is_terminal() && p.tab_name.eq_ignore_ascii_case(name))
+        .collect();
+    if dest.is_empty() {
+        let mut names: Vec<&str> = panes.iter().map(|p| p.tab_name.as_str()).collect();
+        names.sort_unstable();
+        names.dedup();
+        bail!("no tab named '{name}' (tabs: {})", names.join(", "));
+    }
+    let to = dest[0].tab_name.clone();
+    // Prefer the pane running claude, then the tab's focused pane, then any live one.
+    let pane = dest
+        .iter()
+        .find(|p| p.runs_claude() && !p.exited)
+        .or_else(|| dest.iter().find(|p| p.is_focused && !p.exited))
+        .or_else(|| dest.iter().find(|p| !p.exited))
+        .ok_or_else(|| anyhow!("tab '{to}' has no live terminal pane"))?;
+
+    let state = State::open(&session.name)?;
+    let id = state.next_msg_id()?;
+    let render = |t: &str| {
+        t.replace("{id}", &id.to_string())
+            .replace("{from}", &from)
+            .replace("{to}", &to)
+            .replace("{message}", message)
+    };
+    // Message text now, Enter after a pause, so they land as separate pty reads.
+    let text = format!("\n{}{}\n{}\n", render(&cfg.prefix), message, render(&cfg.postfix));
+    session.write_chars(pane.id, text)?;
+    std::thread::sleep(Duration::from_millis(cfg.enter_delay_ms));
+    session.write_bytes(pane.id, vec![b'\r'])?;
+
+    let m = Message { id, ts: now(), from, to: to.clone(), pane: pane.id, msg: message.to_owned() };
+    state.log_message(&m)?;
+    log_line(&format!("[{}] msg#{id} {} -> {} pane {}", session.name, m.from, to, pane.id));
+    println!("msg#{id} sent to {to} on pane {}", pane.id);
+    Ok(())
+}
+
+#[derive(serde::Serialize)]
+struct TabRow {
+    tab_id: usize,
+    position: usize,
+    name: String,
+    panes: usize,
+    status: Option<String>,
+    last_msg_to: Option<u64>,
+    last_msg_from: Option<u64>,
+}
+
+fn list(json: bool) -> Result<()> {
+    let session = Session::connect()?;
+    let panes = session.panes()?;
+    let state = State::open(&session.name)?;
+    let msgs = state.messages();
+
+    let mut rows: Vec<TabRow> = vec![];
+    for p in panes.iter().filter(|p| p.is_terminal()) {
+        if let Some(row) = rows.iter_mut().find(|r| r.tab_id == p.tab_id) {
+            row.panes += 1;
+            if row.status.is_none() {
+                row.status = state.status(p.id).map(|s| s.state);
+            }
+            continue;
+        }
+        let last = |pick: fn(&Message) -> &str| {
+            msgs.iter().rev().find(|m| pick(m).eq_ignore_ascii_case(&p.tab_name)).map(|m| m.id)
+        };
+        rows.push(TabRow {
+            tab_id: p.tab_id,
+            position: p.tab_position,
+            name: p.tab_name.clone(),
+            panes: 1,
+            status: state.status(p.id).map(|s| s.state),
+            last_msg_to: last(|m| &m.to),
+            last_msg_from: last(|m| &m.from),
         });
     }
-    let json = serde_json::to_string_pretty(value).unwrap_or_else(|e| {
-        eprintln!("zellij-crew: failed to serialize settings: {}", e);
-        process::exit(1);
-    });
-    fs::write(path, json + "\n").unwrap_or_else(|e| {
-        eprintln!("zellij-crew: failed to write {}: {}", path.display(), e);
-        process::exit(1);
-    });
+    rows.sort_by_key(|r| r.position);
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&rows)?);
+        return Ok(());
+    }
+    println!("{:<4} {:<4} {:<16} {:>5}  {:<10} {:>7} {:>9}", "ID", "POS", "NAME", "PANES", "STATUS", "LAST_TO", "LAST_FROM");
+    for r in rows {
+        let opt = |v: Option<u64>| v.map(|n| format!("#{n}")).unwrap_or_else(|| "-".into());
+        println!(
+            "{:<4} {:<4} {:<16} {:>5}  {:<10} {:>7} {:>9}",
+            r.tab_id,
+            r.position,
+            r.name,
+            r.panes,
+            r.status.as_deref().unwrap_or("-"),
+            opt(r.last_msg_to),
+            opt(r.last_msg_from)
+        );
+    }
+    Ok(())
 }
 
-fn has_our_hook(entry: &Value) -> bool {
-    if let Some(hooks) = entry.get("hooks").and_then(|h| h.as_array()) {
-        for hook in hooks {
-            if let Some(cmd) = hook.get("command").and_then(|c| c.as_str()) {
-                // Matches both old "zellij-crew-claude" and new "zellij-crew" hooks
-                if cmd.contains("zellij/zellij-crew") {
-                    return true;
-                }
-            }
-        }
+fn show_config(config: Option<&std::path::Path>) -> Result<()> {
+    let cfg = Config::load(config)?;
+    match (&cfg.path, Config::path(config)) {
+        (Some(p), _) => println!("config:         {}", p.display()),
+        (None, Some(p)) => println!("config:         {} (absent, using defaults)", p.display()),
+        (None, None) => println!("config:         (no config dir found, using defaults)"),
     }
-    false
-}
-
-fn make_hook_entry(mapping: &HookMapping) -> Value {
-    let command = format!("{} status {}", cli_path(), mapping.state);
-    let mut entry = serde_json::Map::new();
-    if let Some(m) = mapping.matcher {
-        entry.insert("matcher".to_string(), Value::String(m.to_string()));
-    }
-    entry.insert(
-        "hooks".to_string(),
-        serde_json::json!([{"type": "command", "command": command}]),
-    );
-    Value::Object(entry)
-}
-
-fn do_setup() {
-    let path = settings_path();
-    let mut settings = read_settings(&path);
-    let mut installed = 0u32;
-    let mut skipped = 0u32;
-
-    if settings.get("hooks").is_none() {
-        settings
-            .as_object_mut()
-            .unwrap()
-            .insert("hooks".to_string(), serde_json::json!({}));
-    }
-
-    let hooks = settings["hooks"].as_object_mut().unwrap_or_else(|| {
-        eprintln!("zellij-crew: .hooks is not an object in settings.json");
-        process::exit(1);
-    });
-
-    for mapping in HOOK_MAPPINGS {
-        let event_array = hooks
-            .entry(mapping.event)
-            .or_insert_with(|| Value::Array(vec![]));
-
-        let arr = event_array.as_array_mut().unwrap_or_else(|| {
-            eprintln!(
-                "zellij-crew: .hooks.{} is not an array in settings.json",
-                mapping.event
-            );
-            process::exit(1);
-        });
-
-        let new_entry = make_hook_entry(mapping);
-        let already = arr.iter().any(|e| e == &new_entry);
-        if already {
-            skipped += 1;
-        } else {
-            arr.push(new_entry);
-            installed += 1;
-        }
-    }
-
-    write_settings(&path, &settings);
-    eprintln!(
-        "zellij-crew: installed {} hooks, {} already present ({})",
-        installed, skipped, path.display()
-    );
-}
-
-fn do_remove() {
-    let path = settings_path();
-    if !path.exists() {
-        eprintln!("zellij-crew: {} not found, nothing to remove", path.display());
-        return;
-    }
-
-    let mut settings = read_settings(&path);
-    let mut removed = 0u32;
-
-    if let Some(hooks) = settings.get_mut("hooks").and_then(|h| h.as_object_mut()) {
-        let events: Vec<String> = hooks.keys().cloned().collect();
-        for event in &events {
-            if let Some(arr) = hooks.get_mut(event).and_then(|v| v.as_array_mut()) {
-                let before = arr.len();
-                arr.retain(|e| !has_our_hook(e));
-                removed += (before - arr.len()) as u32;
-            }
-        }
-        let empty_events: Vec<String> = hooks
-            .iter()
-            .filter(|(_, v)| v.as_array().is_some_and(|a| a.is_empty()))
-            .map(|(k, _)| k.clone())
-            .collect();
-        for event in empty_events {
-            hooks.remove(&event);
-        }
-    }
-
-    write_settings(&path, &settings);
-    eprintln!(
-        "zellij-crew: removed {} hooks ({})",
-        removed, path.display()
-    );
-}
-
-// ============================================================================
-// Subcommands
-// ============================================================================
-
-fn require_zellij() -> String {
-    if env::var("ZELLIJ").is_err() {
-        process::exit(0);
-    }
-    match env::var("ZELLIJ_PANE_ID") {
-        Ok(id) => id,
-        Err(_) => process::exit(0),
-    }
-}
-
-fn do_status(args: &[String]) {
-    if args.is_empty() {
-        eprintln!("Usage: zellij-crew status <state>");
-        eprintln!("Valid states: {}", VALID_STATES.join(" "));
-        process::exit(1);
-    }
-
-    let pane_id = require_zellij();
-    let state = args[0].as_str();
-
-    if !VALID_STATES.contains(&state) {
-        eprintln!("zellij-crew: invalid state '{}'", state);
-        eprintln!("Valid states: {}", VALID_STATES.join(" "));
-        process::exit(1);
-    }
-
-    let pipe_args = format!("pane={},state={}", pane_id, state);
-    let err = process::Command::new("zellij")
-        .args(["pipe", "--name", "zellij-crew:status", "--args", &pipe_args])
-        .exec();
-    eprintln!("zellij-crew: failed to exec zellij: {}", err);
-    process::exit(1);
-}
-
-fn do_state() {
-    require_zellij();
-    let err = process::Command::new("zellij")
-        .args(["pipe", "--name", "zellij-crew:status", "--args", "format=json,state_query", "--", ""])
-        .exec();
-    eprintln!("zellij-crew: failed to exec zellij: {}", err);
-    process::exit(1);
-}
-
-fn do_tell(args: &[String]) {
-    if args.len() < 2 {
-        eprintln!("Usage: zellij-crew tell <name> <message...>");
-        process::exit(1);
-    }
-
-    let pane_id = require_zellij();
-    let dest = &args[0];
-    let message = args[1..].join(" ");
-
-    let pipe_args = format!("to={},pane={}", dest, pane_id);
-    let err = process::Command::new("zellij")
-        .args([
-            "pipe", "--name", "zellij-crew:msg",
-            "--args", &pipe_args,
-            "--", &message,
-        ])
-        .exec();
-    eprintln!("zellij-crew: failed to exec zellij: {}", err);
-    process::exit(1);
-}
-
-fn main() {
-    let args: Vec<String> = env::args().skip(1).collect();
-
-    if args.is_empty() {
-        print_help();
-        process::exit(1);
-    }
-
-    match args[0].as_str() {
-        "--help" | "-h" => print_help(),
-        "--setup" => do_setup(),
-        "--remove" => do_remove(),
-        "status" => do_status(&args[1..]),
-        "state" => do_state(),
-        "tell" => do_tell(&args[1..]),
-        other => {
-            eprintln!("zellij-crew: unknown command '{}'", other);
-            eprintln!("Run with --help for usage");
-            process::exit(1);
-        }
-    }
+    println!("session:        {}", zellij::resolve_session_name().unwrap_or_else(|e| format!("({e})")));
+    println!("state dir:      {}", zellij_utils::consts::ZELLIJ_TMP_DIR.join("zellij-crew").display());
+    println!("log:            {}", zellij_utils::consts::ZELLIJ_TMP_LOG_DIR.join("zellij-crew.log").display());
+    println!("enter_delay_ms: {}", cfg.enter_delay_ms);
+    println!("prefix:         {:?}", cfg.prefix);
+    println!("postfix:        {:?}", cfg.postfix);
+    Ok(())
 }

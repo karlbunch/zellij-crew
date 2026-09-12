@@ -19,23 +19,25 @@ Requires a sibling checkout of zellij at `../zellij` (the crates are path
 dependencies). See [UPSTREAM.md](UPSTREAM.md) for the pinned commit.
 
 ```bash
-make install
+make install              # builds and copies ~/.config/zellij/zellij-crew.wasm
+make install-permissions  # grants it read/change state ahead of time, no prompt
 ```
-
-This builds the wasm plugin to `~/.config/zellij/zellij-crew.wasm` and the CLI to
-`~/.local/bin/zellij-crew`.
 
 Then enable the naming daemon in `~/.config/zellij/config.kdl`:
 
 ```kdl
 load_plugins {
-    "file:~/.config/zellij/zellij-crew.wasm"
+    "file:~/.config/zellij/zellij-crew.wasm" {
+        names "Alice Bob Carol Dave Emma Frank Grace Henry Ivy Jack"
+    }
 }
 ```
 
-On first session start zellij asks once to grant the plugin permission to read and
-change application state (it renames tabs). To skip the prompt across many hosts, see
-the pre-seed note in [DESIGN.md](DESIGN.md#permissions).
+`names` is one space-separated string; omit it for the built-in 26-name pool.
+
+Without the pre-seeded grant, the first session shows a one-time yes/no prompt as a
+floating pane in the first tab. Answer it with `y`; closing that pane instead unloads
+the daemon for the session. Details in [DESIGN.md](DESIGN.md#permissions).
 
 ## Use
 
@@ -50,16 +52,19 @@ zellij-crew name            # this pane's tab name
 
 ## Configuration
 
-Optional `zellij-crew.kdl` next to your `config.kdl` sets the name pool and the
-message wrapping. Defaults are built in; the file is only needed to change them. See
-[DESIGN.md](DESIGN.md#configuration) for the schema.
+The name pool is set on the `load_plugins` entry in `config.kdl` (`names "..."`).
+The CLI's message wrapping lives in an optional `zellij-crew.kdl` next to
+`config.kdl`. Defaults are built in for both; the settings are only needed to change
+them. See [DESIGN.md](DESIGN.md#configuration) for the schema.
 
 ## Build targets
 
 | Target | Description |
 |--------|-------------|
-| `make build` | build the wasm plugin and the CLI |
-| `make install` | build, then copy plugin and CLI into place |
+| `make install` | build the plugin and copy it to `~/.config/zellij/zellij-crew.wasm` |
+| `make install-permissions` | pre-seed the plugin's grant in `~/.cache/zellij/permissions.kdl` |
+| `make reload NAMES="..."` | reinstall and hot-reload the daemon in the running session; `NAMES` must match `config.kdl` |
+| `make build-cli` / `install-cli` | the CLI, once it lands (static musl, needs `musl-tools`) |
 | `make cross` | cross-build the CLI for aarch64 musl |
 | `make clean` | `cargo clean` |
 

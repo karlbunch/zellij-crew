@@ -2,3 +2,7 @@
 Cargo.lock
 *.wasm
 .DS_Store
+
+# bd (beads) 0.56+ dolt runtime files; older .beads/.gitignore predates these names
+.beads/dolt-server.*
+.beads/dolt-monitor.*

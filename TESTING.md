@@ -1,8 +1,8 @@
 # Testing
 
 All tests run in a throwaway zellij session with its own config, so your real session
-and config are never involved. The cases below are what the naming daemon has been
-verified against; the CLI cases describe the planned tool.
+and config are never involved. The cases below are what the naming daemon and the CLI
+have been verified against.
 
 ## Throwaway session harness
 

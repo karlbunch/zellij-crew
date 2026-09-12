@@ -28,9 +28,10 @@ build: build-plugin build-cli
 build-plugin:
 	cargo build --release --target $(WASM_TARGET) -p zellij-crew-plugin
 
+# The vendored curl and OpenSSL are C; point their build at the musl compiler.
 build-cli:
 	@command -v musl-gcc >/dev/null || { echo "musl-gcc not found: sudo apt install musl-tools (Debian/Ubuntu) or xbps-install musl (Void)" >&2; exit 1; }
-	cargo build --release --target $(MUSL_TARGET) -p zellij-crew-cli
+	CC_x86_64_unknown_linux_musl=musl-gcc cargo build --release --target $(MUSL_TARGET) -p zellij-crew-cli
 
 # Native (non-static) CLI build for local testing; no musl toolchain needed.
 build-cli-native:
@@ -42,9 +43,11 @@ install-plugin: build-plugin
 	@mkdir -p $(CONFIG_DIR)
 	cp $(WASM_BIN) $(PLUGIN)
 
+# The binary lives next to the plugin (a synced dir) with a symlink on PATH.
 install-cli: build-cli
-	@mkdir -p $(BIN_DIR)
-	install -m 755 $(CLI_BIN) $(BIN_DIR)/zellij-crew
+	@mkdir -p $(CONFIG_DIR) $(BIN_DIR)
+	install -m 755 $(CLI_BIN) $(CONFIG_DIR)/zellij-crew
+	ln -sf $(CONFIG_DIR)/zellij-crew $(BIN_DIR)/zellij-crew
 
 # Grant the daemon's two permissions ahead of time so no session ever shows the
 # prompt (closing the prompt pane would unload the daemon for that session). The

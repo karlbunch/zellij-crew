@@ -6,3 +6,12 @@ Cargo.lock
 # bd (beads) 0.56+ dolt runtime files; older .beads/.gitignore predates these names
 .beads/dolt-server.*
 .beads/dolt-monitor.*
+
+# Agent per-user state (approved commands, locks, worktrees): never committed
+**/.claude/*
+!**/.claude/settings.json
+!**/.claude/CLAUDE.md
+!**/.claude/commands/
+!**/.claude/agents/
+!**/.claude/skills/
+CLAUDE.local.md
